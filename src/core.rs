@@ -44,6 +44,39 @@ pub struct Stats {
     pub maximum_absolute_ms: f64,
 }
 
+/// Independent per-device receipt statistics (not absolute input latency).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DeviceSnapshot {
+    pub press_count: usize,
+    pub last_event_ms: Option<f64>,
+    pub age_ms: Option<f64>,
+    pub last_interval_ms: Option<f64>,
+    pub mean_interval_ms: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DeviceAccumulator {
+    count: usize,
+    last_ticks: Option<i64>,
+    last_interval_ticks: Option<i64>,
+    total_interval_ticks: i64,
+}
+
+impl DeviceAccumulator {
+    fn record(&mut self, ticks: i64) {
+        if let Some(previous) = self.last_ticks {
+            // Reordered timestamps should not corrupt the interval average.
+            if ticks >= previous {
+                let difference = ticks - previous;
+                self.last_interval_ticks = Some(difference);
+                self.total_interval_ticks += difference;
+            }
+        }
+        self.count += 1;
+        self.last_ticks = Some(ticks);
+    }
+}
+
 pub struct Session {
     start_ticks: i64,
     frequency: i64,
@@ -51,6 +84,8 @@ pub struct Session {
     mouse_held: bool,
     keyboard_held: bool,
     trials: Vec<Trial>,
+    mouse_live: DeviceAccumulator,
+    keyboard_live: DeviceAccumulator,
 }
 
 impl Session {
@@ -63,6 +98,8 @@ impl Session {
             mouse_held: false,
             keyboard_held: false,
             trials: Vec::new(),
+            mouse_live: DeviceAccumulator::default(),
+            keyboard_live: DeviceAccumulator::default(),
         }
     }
 
@@ -79,6 +116,26 @@ impl Session {
 
     pub fn reset(&mut self, now_ticks: i64) {
         *self = Session::new(now_ticks, self.frequency);
+    }
+
+    /// See the independent activity for either device, whether paired or not.
+    pub fn device_snapshot(&self, kind: Kind, now_ticks: i64) -> DeviceSnapshot {
+        let acc = match kind {
+            Kind::Mouse => &self.mouse_live,
+            Kind::Keyboard => &self.keyboard_live,
+        };
+        let to_ms = |v: i64| self.ms(v);
+        DeviceSnapshot {
+            press_count: acc.count,
+            last_event_ms: acc.last_ticks.map(|v| to_ms(v - self.start_ticks)),
+            age_ms: acc.last_ticks.map(|v| to_ms(now_ticks.saturating_sub(v))),
+            last_interval_ms: acc.last_interval_ticks.map(to_ms),
+            mean_interval_ms: if acc.count >= 2 {
+                Some(to_ms(acc.total_interval_ticks) / (acc.count - 1) as f64)
+            } else {
+                None
+            },
+        }
     }
 
     pub fn trial_count(&self) -> usize {
@@ -112,6 +169,10 @@ impl Session {
     }
 
     fn add_event(&mut self, kind: Kind, ticks: i64) {
+        match kind {
+            Kind::Mouse => self.mouse_live.record(ticks),
+            Kind::Keyboard => self.keyboard_live.record(ticks),
+        }
         let next = Event { kind, ticks };
         let Some(previous) = self.pending.take() else {
             self.pending = Some(next);
@@ -218,6 +279,43 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_live_mouse_and_keyboard_activity() {
+        let mut s = Session::new(50_000, 1_000_000);
+        s.mouse_button(true, 60_000);
+        let mouse = s.device_snapshot(Kind::Mouse, 61_000);
+        let keyboard = s.device_snapshot(Kind::Keyboard, 61_000);
+        assert_eq!(mouse.press_count, 1);
+        assert_eq!(mouse.last_event_ms, Some(10.0));
+        assert_eq!(mouse.age_ms, Some(1.0));
+        assert_eq!(mouse.last_interval_ms, None);
+        assert_eq!(keyboard.press_count, 0);
+        assert_eq!(keyboard.age_ms, None);
+        assert_eq!(s.trial_count(), 0);
+        s.space_key(true, 62_000);
+        assert_eq!(s.device_snapshot(Kind::Keyboard, 63_000).press_count, 1);
+        assert_eq!(s.trial_count(), 1);
+    }
+
+    #[test]
+    fn repeat_inputs_and_pause_do_not_add_phantom_presses() {
+        let mut s = Session::new(0, 1_000_000);
+        s.mouse_button(true, 1_000);
+        s.mouse_button(true, 2_000);
+        assert_eq!(s.device_snapshot(Kind::Mouse, 5_000).press_count, 1);
+        s.mouse_button(false, 3_000);
+        s.mouse_button(true, 6_000);
+        let view = s.device_snapshot(Kind::Mouse, 7_000);
+        assert_eq!(view.press_count, 2);
+        assert_eq!(view.last_interval_ms, Some(5.0));
+        assert_eq!(view.mean_interval_ms, Some(5.0));
+        s.break_pair();
+        assert_eq!(s.device_snapshot(Kind::Mouse, 7_000).press_count, 2);
+        s.reset(20_000);
+        assert_eq!(s.device_snapshot(Kind::Mouse, 21_000).press_count, 0);
+    }
+
 
     #[test]
     fn mouse_first_is_positive() {
