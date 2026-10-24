@@ -467,54 +467,85 @@ unsafe fn make_gui(hwnd:H){
     let f_large=font(29,FONT_BOLD);
     let f_title=font(28,FONT_BOLD);
 
-    text(hwnd,instance,"INPUT TIMING LAB",30,19,830,45,f_title);
-    text(hwnd,instance,
-        "LIVE MOUSE + KEYBOARD  •  Raw Input timestamps  •  Results appear automatically",
-        32,68,880,26,f_small);
+    CREATE_GROUP.with(|g|g.set(0));
+    text(hwnd,instance,"INPUT TIMING LAB",30,16,860,45,f_title);
+    text(hwnd,instance,"Three tests in one app  •  Win32 Raw Input  •  Live results without exporting files",
+        32,62,860,24,f_small);
+    control(hwnd,instance,"BUTTON","1. Input Comparison",ID_MODE_COMPARE,
+        32,102,270,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","2. Keyboard Diagnostics",ID_MODE_KEYBOARD,
+        319,102,281,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","3. Mouse Reaction Time",ID_MODE_REACTION,
+        616,102,288,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     let start=control(hwnd,instance,"BUTTON","Pause",ID_START,
-        31,108,165,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    control(hwnd,instance,"BUTTON","Reset",ID_RESET,
-        211,108,111,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        31,163,155,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","Reset mode",ID_RESET,
+        205,163,135,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     control(hwnd,instance,"BUTTON","Export CSV",ID_SAVE,
-        338,108,130,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    let recording=text(hwnd,instance,"",482,112,418,32,f_medium);
+        357,163,130,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    let recording=text(hwnd,instance,"",500,167,415,32,f_medium);
 
-    // Each input panel updates on its own, even when no matched pair exists.
-    text(hwnd,instance,"MOUSE · LEFT CLICK",32,173,395,30,f_medium);
-    text(hwnd,instance,"KEYBOARD · SPACE",489,173,395,30,f_medium);
-    let mouse_count=text(hwnd,instance,"0 clicks",32,205,410,51,f_large);
-    let key_count=text(hwnd,instance,"0 key presses",489,205,410,51,f_large);
+    CREATE_GROUP.with(|g|g.set(1));
+    text(hwnd,instance,"LIVE MOUSE · LEFT CLICK",32,229,410,27,f_medium);
+    text(hwnd,instance,"LIVE KEYBOARD · SPACE",492,229,410,27,f_medium);
+    let mouse_count=text(hwnd,instance,"0 clicks",32,261,410,46,f_large);
+    let key_count=text(hwnd,instance,"0 key presses",492,261,410,46,f_large);
+    let mouse_last=text(hwnd,instance,"Last event: —",32,316,410,25,f_small);
+    let key_last=text(hwnd,instance,"Last event: —",492,316,410,25,f_small);
+    let mouse_age=text(hwnd,instance,"Seen: No input yet",32,343,410,25,f_small);
+    let key_age=text(hwnd,instance,"Seen: No input yet",492,343,410,25,f_small);
+    let mouse_interval=text(hwnd,instance,"Press-to-press interval: —",32,370,410,25,f_small);
+    let key_interval=text(hwnd,instance,"Press-to-press interval: —",492,370,410,25,f_small);
+    text(hwnd,instance,"LIVE ARRIVAL-TIME COMPARISON",32,409,835,30,f_medium);
+    text(hwnd,instance,"PAIRED",32,450,180,22,f_small);
+    text(hwnd,instance,"MOUSE FIRST",240,450,190,22,f_small);
+    text(hwnd,instance,"KEYBOARD FIRST",472,450,190,22,f_small);
+    text(hwnd,instance,"MEDIAN GAP",700,450,192,22,f_small);
+    let count=text(hwnd,instance,"0",32,478,180,47,f_large);
+    let mouse=text(hwnd,instance,"0",240,478,180,47,f_large);
+    let keyboard=text(hwnd,instance,"0",472,478,180,47,f_large);
+    let median=text(hwnd,instance,"—",700,478,192,47,f_large);
+    let latest_pair=text(hwnd,instance,"Latest matched pair: waiting for input",32,533,855,30,f_medium);
+    let secondary=text(hwnd,instance,"",32,570,855,30,f_small);
+    text(hwnd,instance,"RECENT PAIRED RESULTS",32,612,855,27,f_medium);
+    let recent=text(hwnd,instance,"",32,646,858,178,f_small);
+    text(hwnd,instance,"Positive = mouse first  •  Negative = keyboard first",
+        32,826,858,23,f_small);
+    let notification=text(hwnd,instance,"",32,851,858,23,f_small);
+    text(hwnd,instance,"Arrival times are not absolute input latency. A synchronized actuator is required for hardware comparisons.",
+        32,880,858,22,f_small);
 
-    let mouse_last=text(hwnd,instance,"Last event: —",32,267,430,26,f_small);
-    let key_last=text(hwnd,instance,"Last event: —",489,267,420,26,f_small);
-    let mouse_age=text(hwnd,instance,"Seen: No input yet",32,294,430,25,f_small);
-    let key_age=text(hwnd,instance,"Seen: No input yet",489,294,420,25,f_small);
-    let mouse_interval=text(hwnd,instance,"Press-to-press interval: —",32,321,430,26,f_small);
-    let key_interval=text(hwnd,instance,"Press-to-press interval: —",489,321,420,26,f_small);
+    CREATE_GROUP.with(|g|g.set(2));
+    text(hwnd,instance,"KEYBOARD EVENT DIAGNOSTICS",32,230,870,34,f_title);
+    text(hwnd,instance,"Test combinations, rollover and releases. Press and release keys normally.",
+        33,276,870,24,f_small);
+    text(hwnd,instance,"RAW KEY-DOWN / KEY-UP COUNTS",32,314,870,25,f_medium);
+    let counters=text(hwnd,instance,"",32,351,870,31,f_small);
+    text(hwnd,instance,"KEYS WINDOWS CURRENTLY REPORTS AS HELD",32,397,870,25,f_medium);
+    let held=text(hwnd,instance,"",32,430,870,76,f_medium);
+    text(hwnd,instance,"SUSPECTED EVENT ANOMALIES",32,527,870,28,f_medium);
+    let alerts=text(hwnd,instance,"",32,562,870,48,f_small);
+    let durations=text(hwnd,instance,"",32,618,870,36,f_small);
+    text(hwnd,instance,"RECENT RAW KEY EVENTS",32,673,870,27,f_medium);
+    let key_recent=text(hwnd,instance,"",32,710,870,175,f_small);
+    text(hwnd,instance,"A >3 s held state is a warning, not proof of a defective key. Missing physical input cannot be proven in software.",
+        32,891,870,24,f_small);
 
-    text(hwnd,instance,"LIVE MOUSE / KEYBOARD COMPARISON",32,369,840,30,f_medium);
-    text(hwnd,instance,"MATCHED PAIRS",32,411,200,22,f_small);
-    text(hwnd,instance,"MOUSE FIRST",247,411,194,22,f_small);
-    text(hwnd,instance,"KEYBOARD FIRST",470,411,190,22,f_small);
-    text(hwnd,instance,"MEDIAN GAP",697,411,188,22,f_small);
-    let count=text(hwnd,instance,"0",32,439,180,49,f_large);
-    let mouse=text(hwnd,instance,"0",247,439,180,49,f_large);
-    let keyboard=text(hwnd,instance,"0",470,439,180,49,f_large);
-    let median=text(hwnd,instance,"—",697,439,200,49,f_large);
+    CREATE_GROUP.with(|g|g.set(3));
+    text(hwnd,instance,"MOUSE REACTION TIME",32,232,800,40,f_title);
+    let arm_button=control(hwnd,instance,"BUTTON","Start trial",ID_REACTION_ARM,
+        32,274,185,37,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    let status=text(hwnd,instance,"Ready. Click Start trial.",231,277,675,32,f_medium);
+    // The colored test area is painted by WM_PAINT, not a STATIC child.
+    text(hwnd,instance,"REACTION RESULTS — milliseconds",32,620,830,28,f_medium);
+    let last=text(hwnd,instance,"Last result: —",32,662,410,36,f_large);
+    let rx_stats=text(hwnd,instance,"",32,710,850,30,f_medium);
+    text(hwnd,instance,"RECENT TRIALS",32,754,850,24,f_medium);
+    let rx_recent=text(hwnd,instance,"",32,789,850,95,f_small);
+    text(hwnd,instance,"The timer starts after the green frame's paint submission; monitor scan-out time is not measured.",
+        32,891,875,23,f_small);
 
-    let latest_pair=text(hwnd,instance,"Latest matched pair: waiting for input",32,502,875,28,f_medium);
-    let secondary=text(hwnd,instance,"",32,535,875,30,f_small);
-
-    text(hwnd,instance,"RECENT PAIRED RESULTS (LIVE)",32,588,820,27,f_medium);
-    let recent=text(hwnd,instance,"",32,621,865,174,f_small);
-    text(hwnd,instance,
-        "Positive = mouse first  •  Negative = keyboard first  •  F5 = pause/resume",
-        32,805,875,24,f_small);
-    let notification=text(hwnd,instance,"",32,832,870,24,f_small);
-    text(hwnd,instance,
-        "Single-device intervals are NOT input latency. Comparisons measure Windows app arrival times, not hardware lag.",
-        32,858,885,22,f_small);
-
+    CREATE_GROUP.with(|g|g.set(0));
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             app.labels=Some(Labels{
@@ -523,12 +554,15 @@ unsafe fn make_gui(hwnd:H){
                 key_count,key_last,key_age,key_interval,
                 count,mouse,keyboard,median,secondary,latest_pair,recent,notification,
             });
+            app.key_views=Some(KeyboardViews{counters,held,alerts,durations,recent:key_recent});
+            app.reaction_views=Some(ReactionViews{
+                action:arm_button,
+                status,stats:rx_stats,last,recent:rx_recent,
+            });
         }
     });
-    refresh();
-    // Fonts are intentionally retained until this short-lived process exits.
+    select_mode(hwnd,1);
 }
-
 unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
     match msg{
         WM_CREATE=>{make_gui(hwnd);return 0;}
@@ -602,7 +636,10 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
     STATE.with(|cell|{
         *cell.borrow_mut()=Some(State{
             session:Session::new(now(),frequency),active:true,labels:None,
-            note:"LIVE capture is ON. Click and press Space to see instant results above.".into(),
+            note:"Live capture active. Select any of the three modes above.".into(),
+            mode:1,groups:std::array::from_fn(|_|Vec::new()),frequency,
+            keyboard:KeyboardDiagnostics::new(frequency),key_views:None,
+            reaction:ReactionTest::default(),reaction_views:None,
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");
@@ -617,7 +654,7 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
         }
         let hwnd=CreateWindowExW(0,cls.as_ptr(),title.as_ptr(),
             WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_VISIBLE,
-            100,45,950,934,null_mut(),null_mut(),instance,null());
+            100,45,950,966,null_mut(),null_mut(),instance,null());
         if hwnd.is_null(){return Err(io::Error::last_os_error().into());}
         let devices=[
             RawDevice{page:1,usage:2,flags:RIDEV_INPUTSINK,hwnd},
