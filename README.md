@@ -1,6 +1,6 @@
 # Mouse / Keyboard Input Timing Lab
 
-A native **Windows x64 GUI** built in Rust, with three interactive diagnostic modes. All results appear directly inside the application. CSV export is optional and **exports the currently selected mode**, including the complete keyboard event history.
+A native **Windows x64 GUI** built in Rust, with four interactive diagnostic modes. All results appear directly inside the application. CSV export is optional and **exports the currently selected mode**, including the complete keyboard event history.
 
 ## Download the executable (no Rust required)
 
@@ -59,6 +59,21 @@ The text report includes:
 
 **Caveat:** Windows asynchronous key state and Raw Input both depend on the operating system; they are not independent physical switch measurements. Key state polling may be unavailable or misleading on a secure desktop. A normal report also cannot guarantee that the keyboard hardware has no fault.
 
+## Mode 4: Live Typing / Character Burst Test
+
+This mode is designed for symptoms such as delayed text appearing in **bursts** in Chrome or Notepad.
+
+1. Select **4. Typing Test**. The focus automatically moves to the large typing box.
+2. Click **Reset mode** and type test text at a normal pace, then type quickly and release each key. Try repeated sentences such as `the quick brown fox jumps over the lazy dog`.
+3. Watch the **actual characters rendered by the Windows native EDIT control**, not guesses from scan codes. Under the box, live timing statistics show how far apart the textbox's **WM_CHAR** messages arrived and whether 3 or more consecutive character messages were handled less than 5 ms apart.
+4. Compare the **Windows WM_CHAR** and **Raw Input** timelines shown underneath. The event time is when our GUI handles the messages, not an independently measured keyboard switch timestamp.
+5. When typing feels delayed or appears all at once, do **not reset**; click **Save Diagnostic Report** and attach `keyboard_diagnostic_report.txt` for analysis. The report contains the test box's actual text, interleaved timestamps, key-down/up/repeats, and Windows key state readings. **Review before sharing.**
+6. **Export CSV** in Typing Test saves the interleaved event timeline as `typing_event_timeline.csv`.
+
+Important distinction: this tool *does not intercept Chrome/Notepad text output*; that would require hooking or inspecting other processes. Instead it provides an independent test of regular Windows character message delivery in our own focused textbox, with a simultaneous Raw Input stream. Multiple WM_CHAR messages handled close together can be caused by batching, fast software processing, IME or other mechanisms; a short gap alone does not prove a keyboard defect. Pasted text or IME composition changes do not necessarily produce one WM_CHAR per visible character.
+
+For privacy, type **only artificial test sentences**, never passwords or sensitive material. This mode does not install any system-wide keyboard hooks, modify Windows settings, or send input records to a network service. The report and CSV are only created if you choose to save them.
+
 ## Mode 3: Mouse Reaction Time
 
 1. Select **Mouse Reaction Time**, and click **Start trial**.
@@ -76,6 +91,7 @@ Clicking before green is a **false start** and does not create a valid time. Res
   - **Input Comparison** → `mouse_keyboard_results.csv`: matched mouse/keyboard trials.
   - **Keyboard Diagnostics** → `keyboard_diagnostics.csv`: **all captured key events** (not merely the 14 shown on screen), per-event scan codes, key names, down/up/repeat status, held durations, concurrent held-key counts and Windows queue-age estimates, a snapshot of any still-held keys, and aggregate anomaly statistics.
   - **Reaction Time** → `reaction_times.csv`: each successful trial and summary statistics including false starts.
+  - **Typing Test** → `typing_event_timeline.csv`: per-message WM_CHAR and Raw Input event times and gaps.
 - Canceling export leaves results intact. The keyboard capture state is resynchronized after the Save dialog closes to avoid false stuck-key alerts.
 - Input data remains on your PC and is not transmitted anywhere.
 - No kernel drivers or background service.

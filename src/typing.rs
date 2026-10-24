@@ -101,6 +101,13 @@ impl TypingMonitor {
             gap_ms:gap,
         });
     }
+    /// Separate paused/mode-switch sessions so gaps cannot be misread as
+    /// a burst or stalled delivery.
+    pub fn suspend(&mut self) {
+        self.previous_char_ticks=None;
+        self.previous_raw_ticks=None;
+        self.consecutive_short_gaps=0;
+    }
     pub fn recent(&self,channel:&str,count:usize)->String {
         let mut entries=self.events.iter().filter(|event|event.channel==channel)
             .rev().take(count).map(|event|format!(
