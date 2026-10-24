@@ -567,54 +567,96 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
     match msg{
         WM_CREATE=>{make_gui(hwnd);return 0;}
         WM_INPUT=>{
-            // Timestamp BEFORE parsing packet or updating UI. No rendering in callback.
+            // Capture QPC as close to Raw Input dispatch as possible.
             let tick=now();
             let mut raw:RawInput=zeroed();
             let mut size=size_of::<RawInput>() as u32;
             let got=GetRawInputData(lp as H,RID_INPUT,
                 (&mut raw as *mut RawInput).cast(),&mut size,size_of::<RawHeader>() as u32);
-            if got!=u32::MAX{
+            let mut repaint=false;
+            if got!=u32::MAX {
                 STATE.with(|cell|{
                     let mut state=cell.borrow_mut();
                     let Some(app)=state.as_mut()else{return};
                     if !app.active{return};
-                    match raw.header.kind{
+                    match raw.header.kind {
                         0 if got as usize>=size_of::<RawHeader>()+size_of::<RawMouse>()=>{
                             let bits=raw.data.mouse.buttons as u16;
-                            // Ignore clicks on the GUI controls. Elsewhere or background: capture.
-                            let mut p=Point::default();
-                            let over_controls=GetCursorPos(&mut p)!=0
-                                && ScreenToClient(hwnd,&mut p)!=0
-                                && p.x>=0&&p.x<850&&p.y>=0&&p.y<173;
-                            if bits&RI_MOUSE_LEFT_BUTTON_UP!=0{
-                                app.session.mouse_button(false,tick);
-                            }
-                            if bits&RI_MOUSE_LEFT_BUTTON_DOWN!=0&&!over_controls{
-                                app.session.mouse_button(true,tick);
+                            if app.mode==1 {
+                                let mut p=Point::default();
+                                let over_toolbar=GetCursorPos(&mut p)!=0
+                                    && ScreenToClient(hwnd,&mut p)!=0
+                                    && p.x>=0&&p.x<930&&p.y>=0&&p.y<215;
+                                if bits&RI_MOUSE_LEFT_BUTTON_UP!=0{
+                                    app.session.mouse_button(false,tick);
+                                }
+                                if bits&RI_MOUSE_LEFT_BUTTON_DOWN!=0&&!over_toolbar{
+                                    app.session.mouse_button(true,tick);
+                                }
+                            } else if app.mode==3 && bits&RI_MOUSE_LEFT_BUTTON_DOWN!=0 {
+                                let mut p=Point::default();
+                                let on_color_panel=GetCursorPos(&mut p)!=0
+                                    && ScreenToClient(hwnd,&mut p)!=0
+                                    && p.x>=32&&p.x<915&&p.y>=315&&p.y<590;
+                                if on_color_panel {
+                                    app.reaction.click(tick,app.frequency);
+                                    repaint=true;
+                                }
                             }
                         }
                         1 if got as usize>=size_of::<RawHeader>()+size_of::<RawKeyboard>()=>{
                             let key=raw.data.key;
-                            if key.key==VK_SPACE {
-                                app.session.space_key(key.flags&RI_KEY_BREAK==0,tick);
+                            if key.key==0xff{return;}
+                            let down=key.flags&RI_KEY_BREAK==0;
+                            if app.mode==1 && key.key==VK_SPACE {
+                                app.session.space_key(down,tick);
+                            } else if app.mode==2 {
+                                let scan=if key.make==0{key.key}else{key.make};
+                                let id=KeyId::new(scan,key.flags);
+                                app.keyboard.event(id,key_name(key.key,scan,key.flags),down,tick);
                             }
                         }
                         _=>{}
                     }
                 });
             }
+            if repaint{InvalidateRect(hwnd,null(),0);}
             return DefWindowProcW(hwnd,msg,wp,lp);
         }
         WM_COMMAND=>{
-            match wp&0xFFFF{
-                ID_START=>toggle(),ID_RESET=>reset(),ID_SAVE=>save(hwnd),_=>{},
+            match wp&0xFFFF {
+                ID_START=>toggle(),
+                ID_RESET=>reset(),
+                ID_SAVE=>save(hwnd),
+                ID_MODE_COMPARE=>select_mode(hwnd,1),
+                ID_MODE_KEYBOARD=>select_mode(hwnd,2),
+                ID_MODE_REACTION=>select_mode(hwnd,3),
+                ID_REACTION_ARM=>arm_reaction(hwnd),
+                _=>{},
             }
-            // Space is the keyboard test input: never leave focus on a button.
+            // Avoid Space keypresses triggering focused buttons in diagnostic mode.
             SetFocus(hwnd);
             return 0;
         }
-        WM_KEYDOWN if wp as u16==VK_F5=>{toggle();return 0;}
-        WM_TIMER=>{refresh();return 0;}
+        WM_KEYDOWN if wp as u16==VK_F5=>{
+            // F5 acts as pause/resume except in the keyboard key-troubleshooting mode.
+            let mode=STATE.with(|cell|cell.borrow().as_ref().map_or(1,|s|s.mode));
+            if mode!=2 {toggle();}
+            return 0;
+        }
+        WM_PAINT=>{paint_reaction(hwnd);return 0;}
+        WM_TIMER=>{
+            let changed=STATE.with(|cell|{
+                let mut state=cell.borrow_mut();
+                let Some(app)=state.as_mut()else{return false};
+                if app.mode==3 && app.active {
+                    app.reaction.tick(now())
+                }else{false}
+            });
+            if changed {InvalidateRect(hwnd,null(),0);}
+            refresh();
+            return 0;
+        }
         WM_DESTROY=>{KillTimer(hwnd,1);PostQuitMessage(0);return 0;}
         _=>{}
     }
