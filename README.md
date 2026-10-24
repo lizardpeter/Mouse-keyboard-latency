@@ -1,6 +1,6 @@
 # Mouse / Keyboard Input Timing Lab
 
-A native **Windows x64 GUI** built in Rust, with three interactive diagnostic modes. All results appear directly inside the application; CSV export is strictly optional.
+A native **Windows x64 GUI** built in Rust, with three interactive diagnostic modes. All results appear directly inside the application. CSV export is optional and **exports the currently selected mode**, including the complete keyboard event history.
 
 ## Download the executable (no Rust required)
 
@@ -49,7 +49,11 @@ Clicking before green is a **false start** and does not create a valid time. Res
 ## Controls and privacy
 
 - The app starts capturing immediately. **Pause** and **Reset mode** apply to the currently selected test. `F5` toggles pause in the comparison and reaction modes.
-- **Export CSV** preserves the input-comparison pairs only, and is never required for live results.
+- **Export CSV** saves the **currently selected mode**, not just comparison trials. The Save dialog proposes a mode-specific filename:
+  - **Input Comparison** → `mouse_keyboard_results.csv`: matched mouse/keyboard trials.
+  - **Keyboard Diagnostics** → `keyboard_diagnostics.csv`: **all captured key events** (not merely the 14 shown on screen), per-event scan codes, key names, down/up/repeat status, held durations, concurrent held-key counts and Windows queue-age estimates, a snapshot of any still-held keys, and aggregate anomaly statistics.
+  - **Reaction Time** → `reaction_times.csv`: each successful trial and summary statistics including false starts.
+- Canceling export leaves results intact. The keyboard capture state is resynchronized after the Save dialog closes to avoid false stuck-key alerts.
 - Input data remains on your PC and is not transmitted anywhere.
 - No kernel drivers or background service.
 

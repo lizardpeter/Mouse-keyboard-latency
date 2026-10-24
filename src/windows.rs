@@ -425,20 +425,28 @@ fn error(hwnd:H,message:&str){
     unsafe{MessageBoxW(hwnd,wide(message).as_ptr(),wide("Input Timing Lab").as_ptr(),ERROR_ICON);}
 }
 fn save(hwnd:H){
-    let before=STATE.with(|cell|{
+    // Freeze capture while the Windows Save dialog is open. The active mode
+    // chooses both the output filename and the serialized data.
+    let (was_active, mode, snapshot_ticks)=STATE.with(|cell|{
         let mut state=cell.borrow_mut();
-        let Some(app)=state.as_mut()else{return false};
+        let Some(app)=state.as_mut() else {return (false,1,now())};
         let prior=app.active;
-        app.active=false;app.session.break_pair();
-        prior
+        app.active=false;
+        app.session.break_pair();
+        (prior,app.mode,now())
     });
+    let (suggested_file, title_text)=match mode {
+        2=>("keyboard_diagnostics.csv","Export complete keyboard diagnostic history"),
+        3=>("reaction_times.csv","Export mouse reaction-time trials"),
+        _=>("mouse_keyboard_results.csv","Export mouse / keyboard comparison"),
+    };
     let mut path=[0u16;1024];
-    let suggested=wide("mouse_keyboard_results.csv");
+    let suggested=wide(suggested_file);
     path[..suggested.len()].copy_from_slice(&suggested);
     let filter=wide("CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0");
-    let title=wide("Save input timing results");
+    let title=wide(title_text);
     let ext=wide("csv");
-    let mut details=SaveFile{
+    let mut details=SaveFile {
         size:size_of::<SaveFile>() as u32,owner:hwnd,instance:null_mut(),
         filter:filter.as_ptr(),custom:null_mut(),custom_max:0,filter_index:1,
         file:path.as_mut_ptr(),file_max:path.len() as u32,
@@ -447,16 +455,22 @@ fn save(hwnd:H){
         file_offset:0,file_extension:0,default_ext:ext.as_ptr(),custom_data:0,
         hook:null_mut(),template:null(),reserved:null_mut(),reserved_num:0,flags_ex:0,
     };
-    if unsafe{GetSaveFileNameW(&mut details)}!=0{
+    if unsafe{GetSaveFileNameW(&mut details)}!=0 {
         let end=path.iter().position(|&c|c==0).unwrap_or(path.len());
         let filename=String::from_utf16_lossy(&path[..end]);
         let result=STATE.with(|cell|{
-            cell.borrow().as_ref().unwrap().session.save_csv(Path::new(&filename))
+            let state=cell.borrow();
+            let app=state.as_ref().expect("GUI state initialized");
+            match mode {
+                2=>app.keyboard.save_csv(Path::new(&filename),snapshot_ticks),
+                3=>app.reaction.save_csv(Path::new(&filename)),
+                _=>app.session.save_csv(Path::new(&filename)),
+            }
         });
         match result{
             Ok(())=>STATE.with(|cell|{
                 if let Some(app)=cell.borrow_mut().as_mut(){
-                    app.note=format!("Saved CSV to {}",filename);
+                    app.note=format!("Saved {} data to {}",mode_title(mode),filename);
                 }
             }),
             Err(e)=>error(hwnd,&format!("Unable to save CSV: {e}")),
@@ -464,7 +478,11 @@ fn save(hwnd:H){
     }
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
-            app.session.break_pair();app.active=before;
+            // A key released while the modal dialog had focus must not
+            // appear stuck after returning to the diagnostics screen.
+            app.keyboard.suspend();
+            app.session.break_pair();
+            app.active=was_active;
         }
     });
     refresh();
