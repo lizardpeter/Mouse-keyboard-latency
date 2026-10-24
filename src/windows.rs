@@ -2,7 +2,7 @@
 //! All UI events and Raw Input callbacks run on the owning GUI thread.
 
 use crate::core::{Kind, Session, DeviceSnapshot};
-use crate::keyboard::{KeyboardDiagnostics,KeyId};
+use crate::keyboard::{KeyboardDiagnostics,KeyId,OsKeyStateMonitor};
 use crate::reaction::{ReactionTest,Phase};
 use std::cell::Cell;
 use std::{cell::RefCell, ffi::c_void, io, mem::{size_of, zeroed}, path::Path,
@@ -25,6 +25,7 @@ const WS_CAPTION:u32=0xC00000; const WS_SYSMENU:u32=0x80000;
 const WS_MINIMIZEBOX:u32=0x20000; const SS_LEFT:u32=0;
 const BS_PUSHBUTTON:u32=0; const SW_SHOW:i32=5;
 const ID_START:usize=101; const ID_RESET:usize=102; const ID_SAVE:usize=103;
+const ID_DIAGNOSTIC_REPORT:usize=105;
 const ID_MODE_COMPARE:usize=201; const ID_MODE_KEYBOARD:usize=202;
 const ID_MODE_REACTION:usize=203; const ID_REACTION_ARM:usize=204;
 const FONT_NORMAL:i32=400; const FONT_BOLD:i32=700;
@@ -106,6 +107,7 @@ extern "system" {
     fn GetCursorPos(out:*mut Point)->i32;
     fn ScreenToClient(hwnd:H,point:*mut Point)->i32;
     fn MessageBoxW(hwnd:H,text:*const u16,caption:*const u16,flags:u32)->i32;
+    fn GetAsyncKeyState(virtual_key:i32)->i16;
     fn GetMessageTime()->i32;
     fn SetBkMode(dc:H,mode:i32)->i32;
     fn SetTextColor(dc:H,color:u32)->u32;
@@ -120,6 +122,27 @@ extern "system" {
 }
 #[link(name="comdlg32")]
 extern "system" { fn GetSaveFileNameW(data:*mut SaveFile)->i32; }
+#[repr(C)]
+struct OsVersionInfo {
+    struct_size:u32, major:u32, minor:u32, build:u32, csd:[u16;128],
+}
+#[link(name="ntdll")]
+extern "system" {
+    fn RtlGetVersion(details:*mut OsVersionInfo)->i32;
+}
+fn system_description()->String {
+    let mut details=OsVersionInfo {
+        struct_size:size_of::<OsVersionInfo>() as u32, major:0, minor:0, build:0,
+        csd:[0;128],
+    };
+    let status=unsafe{RtlGetVersion(&mut details)};
+    if status==0 {
+        format!("Windows {}.{} build {} (x64)",details.major,details.minor,details.build)
+    } else {
+        "Windows x64 (version unavailable)".into()
+    }
+}
+
 #[link(name="kernel32")]
 extern "system" {
     fn GetModuleHandleW(name:*const u16)->H;
@@ -136,7 +159,7 @@ struct Labels {
     secondary:H, latest_pair:H, recent:H, notification:H,
 }
 struct KeyboardViews {
-    counters:H, held:H, alerts:H, durations:H, queue:H, recent:H,
+    counters:H, held:H, alerts:H, durations:H, queue:H, os_state:H, recent:H,
 }
 struct ReactionViews {
     action:H, status:H, stats:H, last:H, recent:H,
@@ -145,7 +168,8 @@ struct State {
     session:Session, active:bool, labels:Option<Labels>, note:String,
     mode:usize, groups:[Vec<H>;4],
     frequency:i64,
-    keyboard:KeyboardDiagnostics, key_views:Option<KeyboardViews>,
+    keyboard:KeyboardDiagnostics, os_keys:OsKeyStateMonitor,
+    key_views:Option<KeyboardViews>,
     reaction:ReactionTest, reaction_views:Option<ReactionViews>,
 }
 thread_local! {
@@ -224,8 +248,14 @@ fn select_mode(hwnd:H,new_mode:usize){
         let mut cell=cell.borrow_mut();
         let Some(app)=cell.as_mut()else{return};
         app.session.break_pair();
-        if app.mode==2 && new_mode!=2 { app.keyboard.suspend(); }
-        if app.mode!=2 && new_mode==2 { app.keyboard.suspend(); }
+        if app.mode==2 && new_mode!=2 {
+            app.keyboard.suspend();
+            app.os_keys.clear_pending();
+        }
+        if app.mode!=2 && new_mode==2 {
+            app.keyboard.suspend();
+            app.os_keys.clear_pending();
+        }
         app.mode=new_mode;
         app.note=match new_mode{
             1=>"Mouse and Space events update live on this page.".into(),
@@ -363,6 +393,9 @@ fn refresh() {
                 "Windows message queue age (approx.): latest {}  |  worst {} ms  |  ≥32 ms delays: {}",
                 kd.latest_queue_age_ms.map_or_else(||"—".into(),|x|format!("{x} ms")),
                 kd.largest_queue_age_ms, kd.slow_queue_events));
+            set_text(k.os_state,&format!(
+                "Raw vs Windows key-state checks: {} samples  |  sustained disagreements: {}",
+                app.os_keys.samples,app.os_keys.confirmed_disagreements));
             set_text(k.recent,&kd.log_display());
         }
         if let Some(r)=app.reaction_views.as_ref(){
@@ -399,6 +432,7 @@ fn toggle(){
         if let Some(app)=cell.borrow_mut().as_mut(){
             app.session.break_pair();
             app.keyboard.suspend();
+            app.os_keys.clear_pending();
             app.active=!app.active;
             app.note=if app.active{
                 "Recording: press LEFT CLICK + SPACE, releasing both before repeating.".into()
@@ -412,7 +446,8 @@ fn reset(){
         if let Some(app)=cell.borrow_mut().as_mut(){
             match app.mode{
                 2=>{app.keyboard=KeyboardDiagnostics::new(app.frequency);
-                    app.note="Keyboard diagnostics cleared.".into();},
+                    app.os_keys=OsKeyStateMonitor::new(now(),app.frequency);
+                    app.note="Keyboard diagnostics and Windows state checks cleared.".into();},
                 3=>{app.reaction.reset();
                     app.note="Reaction results cleared.".into();},
                 _=>{app.session.reset(now());app.note="Input comparison reset.".into();}
@@ -487,6 +522,71 @@ fn save(hwnd:H){
     });
     refresh();
 }
+
+fn save_report(hwnd:H) {
+    // The user is about to share key-name history. Warn explicitly first.
+    let warning=wide("The diagnostic report includes EVERY KEY NAME pressed during this test.\n\n\
+        Only record test inputs, not passwords or private messages.\n\
+        Review the text file before sharing it.\n\nSave report?");
+    let heading=wide("Privacy notice — keyboard diagnostic report");
+    // MB_OKCANCEL | MB_ICONWARNING. 1 means IDOK.
+    if unsafe{MessageBoxW(hwnd,warning.as_ptr(),heading.as_ptr(),0x31)} != 1 {
+        return;
+    }
+
+    // Freeze capture and build a consistent snapshot BEFORE the modal Save
+    // dialog begins processing its own keyboard messages.
+    let (was_active, contents)=STATE.with(|cell|{
+        let mut state=cell.borrow_mut();
+        let Some(app)=state.as_mut() else {return (false,String::new());};
+        if app.mode!=2{return (false,String::new());}
+        let previous=app.active;
+        app.active=false;
+        let snapshot=app.keyboard.build_report(now(),&app.os_keys,&system_description());
+        (previous,snapshot)
+    });
+    if contents.is_empty(){return;}
+
+    let mut name=[0u16;1024];
+    let default_name=wide("keyboard_diagnostic_report.txt");
+    name[..default_name.len()].copy_from_slice(&default_name);
+    let filter=wide("Text report (*.txt)\0*.txt\0All files (*.*)\0*.*\0");
+    let title=wide("Save diagnostic report to share for analysis");
+    let extension=wide("txt");
+    let mut details=SaveFile {
+        size:size_of::<SaveFile>() as u32,owner:hwnd,instance:null_mut(),
+        filter:filter.as_ptr(),custom:null_mut(),custom_max:0,filter_index:1,
+        file:name.as_mut_ptr(),file_max:name.len() as u32,
+        file_title:null_mut(),file_title_max:0,initial_dir:null(),
+        title:title.as_ptr(),flags:OFN_OVERWRITEPROMPT|OFN_PATHMUSTEXIST,
+        file_offset:0,file_extension:0,default_ext:extension.as_ptr(),
+        custom_data:0,hook:null_mut(),template:null(),
+        reserved:null_mut(),reserved_num:0,flags_ex:0,
+    };
+    let confirmed=unsafe{GetSaveFileNameW(&mut details)}!=0;
+    if confirmed {
+        let end=name.iter().position(|&n|n==0).unwrap_or(name.len());
+        let filename=String::from_utf16_lossy(&name[..end]);
+        match std::fs::write(Path::new(&filename),contents) {
+            Ok(())=>STATE.with(|cell|{
+                if let Some(app)=cell.borrow_mut().as_mut(){
+                    app.note=format!("Report saved: {} (review before sharing)",filename);
+                }
+            }),
+            Err(error)=>error(hwnd,&format!("Unable to save diagnostic report: {error}")),
+        };
+    }
+    STATE.with(|cell|{
+        if let Some(app)=cell.borrow_mut().as_mut(){
+            app.keyboard.suspend();
+            app.os_keys.clear_pending();
+            app.session.break_pair();
+            app.active=was_active;
+        }
+    });
+    refresh();
+}
+
 unsafe fn make_gui(hwnd:H){
     let instance=GetModuleHandleW(null());
     let f_small=font(14,FONT_NORMAL);
@@ -544,8 +644,10 @@ unsafe fn make_gui(hwnd:H){
 
     CREATE_GROUP.with(|g|g.set(2));
     text(hwnd,instance,"KEYBOARD EVENT DIAGNOSTICS",32,230,870,34,f_title);
-    text(hwnd,instance,"Test combinations, rollover and releases. Press and release keys normally.",
-        33,276,870,24,f_small);
+    text(hwnd,instance,"Reproduce the issue, then save the full report to share.",
+        33,276,625,24,f_small);
+    control(hwnd,instance,"BUTTON","Save Diagnostic Report",ID_DIAGNOSTIC_REPORT,
+        670,269,232,41,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     text(hwnd,instance,"RAW KEY-DOWN / KEY-UP COUNTS",32,314,870,25,f_medium);
     let counters=text(hwnd,instance,"",32,351,870,31,f_small);
     text(hwnd,instance,"KEYS WINDOWS CURRENTLY REPORTS AS HELD",32,397,870,25,f_medium);
@@ -554,8 +656,9 @@ unsafe fn make_gui(hwnd:H){
     let alerts=text(hwnd,instance,"",32,562,870,48,f_small);
     let durations=text(hwnd,instance,"",32,614,870,33,f_small);
     let queue=text(hwnd,instance,"",32,651,870,26,f_small);
-    text(hwnd,instance,"RECENT RAW KEY EVENTS",32,690,870,27,f_medium);
-    let key_recent=text(hwnd,instance,"",32,721,870,155,f_small);
+    let os_state=text(hwnd,instance,"",32,680,870,27,f_small);
+    text(hwnd,instance,"RECENT RAW KEY EVENTS",32,710,870,26,f_medium);
+    let key_recent=text(hwnd,instance,"",32,739,870,140,f_small);
     text(hwnd,instance,"A >3 s held state is a warning, not proof of a defective key. Missing physical input cannot be proven in software.",
         32,891,870,24,f_small);
 
@@ -582,7 +685,7 @@ unsafe fn make_gui(hwnd:H){
                 key_count,key_last,key_age,key_interval,
                 count,mouse,keyboard,median,secondary,latest_pair,recent,notification,
             });
-            app.key_views=Some(KeyboardViews{counters,held,alerts,durations,queue,recent:key_recent});
+            app.key_views=Some(KeyboardViews{counters,held,alerts,durations,queue,os_state,recent:key_recent});
             app.reaction_views=Some(ReactionViews{
                 action:arm_button,
                 status,stats:rx_stats,last,recent:rx_recent,
@@ -643,7 +746,8 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                                 let id=KeyId::new(scan,key.flags);
                                 let delay=(GetTickCount64() as u32).wrapping_sub(GetMessageTime() as u32);
                                 app.keyboard.observe_queue_age(delay);
-                                app.keyboard.event(id,key_name(key.key,scan,key.flags),down,tick);
+                                app.keyboard.event_vk(
+                                    id,key_name(key.key,scan,key.flags),down,tick,key.key);
                             }
                         }
                         _=>{}
@@ -658,6 +762,7 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                 ID_START=>toggle(),
                 ID_RESET=>reset(),
                 ID_SAVE=>save(hwnd),
+                ID_DIAGNOSTIC_REPORT=>save_report(hwnd),
                 ID_MODE_COMPARE=>select_mode(hwnd,1),
                 ID_MODE_KEYBOARD=>select_mode(hwnd,2),
                 ID_MODE_REACTION=>select_mode(hwnd,3),
@@ -679,9 +784,16 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
             let changed=STATE.with(|cell|{
                 let mut state=cell.borrow_mut();
                 let Some(app)=state.as_mut()else{return false};
-                if app.mode==3 && app.active {
-                    app.reaction.tick(now())
-                }else{false}
+                if !app.active{return false;}
+                if app.mode==2 {
+                    let when=now();
+                    let observed=app.keyboard.observed_vk_states();
+                    for (vk,label,raw_down) in observed {
+                        let os_down=GetAsyncKeyState(vk as i32) < 0;
+                        app.os_keys.sample(vk,&label,raw_down,os_down,when);
+                    }
+                }
+                if app.mode==3 { app.reaction.tick(now()) } else {false}
             });
             if changed {InvalidateRect(hwnd,null(),0);}
             refresh();
@@ -710,7 +822,8 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             session:Session::new(now(),frequency),active:true,labels:None,
             note:"Live capture active. Select any of the three modes above.".into(),
             mode:1,groups:std::array::from_fn(|_|Vec::new()),frequency,
-            keyboard:KeyboardDiagnostics::new(frequency),key_views:None,
+            keyboard:KeyboardDiagnostics::new(frequency),
+            os_keys:OsKeyStateMonitor::new(now(),frequency),key_views:None,
             reaction:ReactionTest::default(),reaction_views:None,
         });
     });
