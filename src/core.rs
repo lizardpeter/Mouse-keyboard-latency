@@ -66,6 +66,21 @@ impl Session {
         }
     }
 
+
+    /// Return captured pairs for display.
+    pub fn trials(&self) -> &[Trial] { &self.trials }
+
+    /// Prevent a partial pair carrying across pause or save operations.
+    pub fn break_pair(&mut self) {
+        self.pending = None;
+        self.mouse_held = false;
+        self.keyboard_held = false;
+    }
+
+    pub fn reset(&mut self, now_ticks: i64) {
+        *self = Session::new(now_ticks, self.frequency);
+    }
+
     pub fn trial_count(&self) -> usize {
         self.trials.len()
     }

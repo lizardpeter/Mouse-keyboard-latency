@@ -1,29 +1,40 @@
-name: Rust CI
+name: Build Windows GUI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 jobs:
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Unit tests
-        run: cargo test --all-targets
-      - name: Build Windows executable
-        run: cargo build --release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mouse-keyboard-latency-windows-x64
-          path: target/release/mouse-keyboard-latency.exe
-
   portable-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Test platform-independent pairing logic
+      - name: Test pairing and statistical calculations
         run: cargo test --all-targets
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Test on Windows
+        run: cargo test --all-targets
+      - name: Build standalone Windows GUI
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Package double-clickable executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/mouse-keyboard-latency.exe dist/Mouse-Keyboard-Latency.exe
+      - name: Upload desktop app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mouse-Keyboard-Latency-Windows-GUI
+          path: dist/Mouse-Keyboard-Latency.exe
+          if-no-files-found: error
+          retention-days: 90

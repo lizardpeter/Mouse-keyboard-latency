@@ -1,38 +1,32 @@
-# Mouse-keyboard-latency
+# Mouse / Keyboard Latency — Windows Desktop App
 
-A lightweight **Rust + Windows Raw Input** tester that compares when left mouse clicks and **Space** keypresses reach a Windows application. Uses `QueryPerformanceCounter` for high-resolution timestamps. No Rust dependencies, drivers, network connections, or input injection.
+A standalone, native Windows x64 desktop application written in Rust. It compares **when mouse left clicks and Space keyboard presses arrive in Windows Raw Input**.
 
-## Run on Windows 10/11 (x64)
+## Download and run (no Rust required)
 
-1. Install [Rust](https://rustup.rs/).
-2. Clone this repository or download its ZIP.
-3. Double-click `run_windows.bat`, or run `cargo run --release` from the repository root.
-4. Press **left mouse button** and **Space** close together, then release both. Repeat 30-100 or more times.
-5. Press **F11** to print intermediate statistics. Press **F12** to finish and save `input_timing_results.csv`.
+1. Open the [Build Windows GUI workflow](../../actions/workflows/ci.yml).
+2. Open the most recent successful run on `main`.
+3. Under **Artifacts**, download `Mouse-Keyboard-Latency-Windows-GUI`.
+4. Extract the ZIP and **double-click `Mouse-Keyboard-Latency.exe`**.
 
-Raw Input is received by a hidden window even when the console is not focused. Both events must arrive within 300 ms to count as a trial. Held buttons and repeated Space key events are ignored. Input timestamps are captured inside the Win32 message callback; console printing is deferred.
+GitHub Actions automatically runs the tests and compiles the Windows release executable whenever `main` is updated. This is a standard GUI application: it does **not** open a command prompt. No driver, service, or Rust installation is required on the receiving computer.
 
-## Reading the results
+## Use
 
-Signed difference is **keyboard arrival time minus mouse arrival time**, in milliseconds.
+- Click **Start recording** to begin listening to mouse and keyboard Raw Input.
+- Left click and press **Space** close together, then release both. Repeat for 30–100+ samples.
+- The dashboard shows completed pairs, mouse-first and keyboard-first totals, median absolute separation, mean signed separation, 95th percentile gap and the 9 latest pairs.
+- Click **Pause**, **Reset**, or **Save CSV...** at any time. CSV export uses the normal Windows Save As dialog. **F5** also toggles recording while the window has keyboard focus.
+- A positive signed difference means the mouse was observed first. A negative difference means the keyboard was observed first.
+- Clicks on the GUI toolbar are ignored. Click elsewhere in the window or outside the window to take measurements. Background Raw Input registration permits capture even when another app is in focus.
+- Pairs farther apart than 300 ms are excluded. Held-button autorepeats are excluded.
 
-- **Positive** means the mouse event arrived first.
-- **Negative** means the keyboard event arrived first.
-- **Zero** means their software timestamps matched.
+## Measurement limitation
 
-Reports number of pairs, mouse-first/keyboard-first counts, signed mean/median, median and 95th-percentile absolute separation, and minimum/maximum absolute separation. The CSV includes per-trial event arrival offsets relative to startup.
+**Results are differences between input arrival times at this application, not actual hardware latency.** Clicking two different physical devices by hand introduces uncertain finger timing, and Windows message scheduling and USB polling affect the timestamps. To compare real hardware input lag, actuate both devices with a common physical trigger. To measure absolute latency, include an external reference for the activation time.
 
-**Critical measurement limitation:** This is not a direct measurement of device hardware input latency. A hand-pressed mouse and keyboard are not triggered at exactly the same time. Measurements also include USB polling, OS queueing, thread scheduling, and callback timing. To compare actual hardware latencies, use a common physical/electrical trigger for both switches; for absolute latency, also measure the physical activation time with external hardware.
+Events stay on the PC. Data is written only when you click **Save CSV...**. No device driver or network connection is used.
 
-Use a wired device pair, a quiet system, and repeated measurements for best repeatability. Disconnect other input devices: this version captures all registered mice/keyboards rather than filtering by device.
+## Development
 
-## Building and testing
-
-```powershell
-cargo test
-cargo build --release
-```
-
-GitHub Actions runs Rust unit tests on Windows and Linux, builds a Windows x64 executable, and uploads it as a workflow artifact. The unit tests cover event ordering, stale pairs, debouncing, and statistical percentiles.
-
-No Windows hardware measurement has been performed in the authoring environment yet. Windows CI confirms compilation, but actual device comparisons must be performed on a Windows PC.
+Build locally on Windows x64 with `cargo run --release`. Run cross-platform pairing/statistics tests with `cargo test`. The native GUI deliberately uses only Win32/GDI, so the Rust crate has no external dependencies.
