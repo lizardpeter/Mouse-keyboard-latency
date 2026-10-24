@@ -573,7 +573,7 @@ fn save_report(hwnd:H) {
                     app.note=format!("Report saved: {} (review before sharing)",filename);
                 }
             }),
-            Err(error)=>error(hwnd,&format!("Unable to save diagnostic report: {error}")),
+            Err(io_error)=>error(hwnd,&format!("Unable to save diagnostic report: {io_error}")),
         };
     }
     STATE.with(|cell|{
