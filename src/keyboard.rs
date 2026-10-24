@@ -45,8 +45,8 @@ pub struct DiagnosticEvent {
 const MAX_EXPORTED_EVENTS: usize = 250_000;
 
 fn csv_field(value: &str) -> String {
-    let escaped = value.replace('"', """");
-    format!(""{}"", escaped)
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
 }
 
 #[derive(Clone)]
