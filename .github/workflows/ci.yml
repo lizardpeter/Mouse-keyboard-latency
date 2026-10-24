@@ -1,0 +1,29 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unit tests
+        run: cargo test --all-targets
+      - name: Build Windows executable
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mouse-keyboard-latency-windows-x64
+          path: target/release/mouse-keyboard-latency.exe
+
+  portable-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test platform-independent pairing logic
+        run: cargo test --all-targets

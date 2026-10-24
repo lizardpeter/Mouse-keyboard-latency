@@ -1,0 +1,8 @@
+[package]
+name = "mouse-keyboard-latency"
+version = "0.1.0"
+edition = "2021"
+description = "Windows Raw Input mouse click vs keyboard keypress timing tester"
+license = "MIT"
+
+[dependencies]
