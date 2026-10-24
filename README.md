@@ -1,51 +1,60 @@
-# Mouse / Keyboard Latency — Live Windows GUI
+# Mouse / Keyboard Input Timing Lab
 
-A standalone Windows desktop application, written in Rust, showing **mouse and keyboard Raw Input activity live inside the window**. No CSV export or Rust installation is required to see results.
+A native **Windows x64 GUI** built in Rust, with three interactive diagnostic modes. All results appear directly inside the application; CSV export is strictly optional.
 
-## Download the Windows application
+## Download the executable (no Rust required)
 
-1. Open **[Build Windows GUI on GitHub Actions](../../actions/workflows/ci.yml)**.
-2. Open the latest successful workflow run on **main**.
-3. Download the artifact **Mouse-Keyboard-Latency-Windows-GUI**.
-4. Extract its ZIP and launch **Mouse-Keyboard-Latency.exe** directly.
+1. Open [GitHub Actions — Build Windows GUI](../../actions/workflows/ci.yml).
+2. Select the newest **successful** run for `main`.
+3. Under **Artifacts**, download `Mouse-Keyboard-Latency-Windows-GUI`.
+4. Extract the ZIP and double-click `Mouse-Keyboard-Latency.exe`.
 
-The app runs as a normal Windows x64 GUI, not a command prompt. GitHub Actions builds a fresh executable automatically on each push to main.
+The Windows build runs automatically when code is pushed to `main`. It produces a normal desktop GUI `.exe`, not a console program. No drivers, extra DLLs, or Rust installation are needed to run the packaged application.
 
-## Live results (automatic)
+## Mode 1: Input Comparison
 
-**Capture begins as soon as the app launches.** Left-click the mouse and/or press **Space** on the keyboard to see two separate panels update automatically, even if only one input device is used.
+- Tracks left mouse button and Space bar arrivals continuously through Windows Raw Input.
+- Shows **mouse presses**, **Space presses**, the most recent timestamps and times since the latest events.
+- Pairs events within 300 ms and reports mouse-first / keyboard-first, signed timing difference, median gap, mean, P95, and a live recent-trial history.
+- Positive (keyboard arrival minus mouse arrival) means **mouse first**; negative means **keyboard first**.
 
-**Mouse live panel**
-- Total left-button presses
-- Most recent event arrival time measured since the recording began
-- How recently the last click occurred
-- Time interval between the last two mouse clicks
+## Mode 2: Keyboard Diagnostics
 
-**Keyboard live panel**
-- Total Space presses
-- Most recent event arrival time measured since the recording began
-- How recently the last Space press occurred
-- Time interval between the last two Space presses
+Use this mode when the keyboard seems to repeat, miss releases, stick, or have key-rollover problems. Press single keys and try pressing several keys together, then releasing all of them.
 
-**Live comparison panel**
-- Total paired events (left-click + Space within 300 ms)
-- Mouse-first vs keyboard-first count
-- Median absolute arrival-time difference
-- Latest pair's signed arrival difference
-- Mean signed difference, 95th percentile separation, and recent paired measurements
+The display shows:
 
-**Positive** signed gap means the mouse arrived first; **negative** means keyboard first. Event data is timestamped on receipt, while the screen updates approximately every 50 ms (20 times per second). No file save is needed to see these metrics.
+- Key-down, key-up and repeat counts.
+- **Every key Windows currently considers held** and how long it has been held (including simultaneous keys).
+- **Potential stuck-key warnings** for keys reporting held longer than 3 seconds.
+- Orphan/unmatched key-up events, which may be caused by a missing preceding press, an event arriving outside the observation window, or a mode switch.
+- Maximum simultaneously held keys reported by Windows, useful for checking rollover.
+- Last press duration, longest held duration, shortest inter-event gap and a live event timeline.
+- **Approximate Windows Raw Input message-queue age**, including worst observed delay and number of arrivals with 32 ms or more of queue delay.
 
-**Controls:** **Pause**, **Reset**, and **Export CSV** (optional). **F5** also pauses/resumes if this app has focus. Click outside the toolbar to count mouse clicks. Raw Input works even if the app is not focused, so you can test while using another window.
+**Interpret alerts as observations, not definitive proof of hardware defects.** Holding a key intentionally triggers a long-held warning. A software observer cannot know that a physical key was pressed if the keyboard never sends an event, nor can it measure physical switch-to-USB latency without an external reference. Raw Input message queue age is an approximate Windows-side scheduling measurement, not hardware input latency.
 
-## Accurate interpretation
+Pausing and changing modes clear tracked held states so a key released outside the observation window will not incorrectly stay flagged forever. Reset mode also clears the diagnostic counts.
 
-This program compares event arrival time **at the Windows application**, not the independent absolute hardware input latency of a mouse or keyboard. An isolated mouse click has no known physical starting timestamp, so it is scientifically impossible to derive the mouse's hardware latency simply from the Windows event timestamp. The per-device press intervals displayed above are **time between separate presses**, not an input-lag measurement.
+## Mode 3: Mouse Reaction Time
 
-The relative timing between two manually pressed devices also includes human finger timing. An externally synchronized actuator is required to meaningfully compare hardware delay; an external timestamped sensor/reference is required for absolute latency.
+1. Select **Mouse Reaction Time**, and click **Start trial**.
+2. The large colored panel tells you to **WAIT**. An unpredictable delay of about **1.5–4 seconds** follows.
+3. When the panel changes to **GREEN**, left-click inside it as quickly as possible.
+4. Your response time immediately appears in **milliseconds**. The app also keeps a running average, best score, trial history, and false-start count.
+5. Repeat as desired, or click **Reset mode**.
 
-The application requires no kernel driver and sends no input data over the network. CSV export only happens when you select it.
+Clicking before green is a **false start** and does not create a valid time. Results are timed using `QueryPerformanceCounter` after the drawing submission of the green frame and the captured Raw Input mouse event. Physical monitor scan-out, pixel response and USB/mouse hardware latency are **not** separately measured, so times are display-submission-to-application estimates rather than lab-calibrated reaction times.
+
+## Controls and privacy
+
+- The app starts capturing immediately. **Pause** and **Reset mode** apply to the currently selected test. `F5` toggles pause in the comparison and reaction modes.
+- **Export CSV** preserves the input-comparison pairs only, and is never required for live results.
+- Input data remains on your PC and is not transmitted anywhere.
+- No kernel drivers or background service.
 
 ## Development
 
-Build locally on Windows x64 with `cargo run --release`. Run pairing and device-timing unit tests with `cargo test`. This application uses only native Windows APIs with no third-party Rust dependencies. GitHub Actions runs tests on Linux and Windows, compiles the release GUI, and uploads it to the workflow run.
+Run `cargo test --all-targets` to execute platform-independent diagnostics/reaction/measurement logic tests. On Windows, `cargo run --release` launches the GUI. Every push to `main` triggers the Windows GitHub Actions release build and produces a downloadable executable.
+
+**Compatibility:** Windows 10/11 x64. All modes capture Windows Raw Input data, not an electrical signal from the switches.

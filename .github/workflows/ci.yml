@@ -26,6 +26,17 @@ jobs:
         run: cargo test --all-targets
       - name: Build standalone Windows GUI
         run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Smoke test GUI can launch
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/mouse-keyboard-latency.exe"
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 3
+          $proc.Refresh()
+          if ($proc.HasExited) {
+            throw "GUI exited immediately with code $($proc.ExitCode)"
+          }
+          Stop-Process -Id $proc.Id -Force
       - name: Package double-clickable executable
         shell: pwsh
         run: |
