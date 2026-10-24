@@ -105,6 +105,13 @@ impl KeyboardDiagnostics {
         }
     }
 
+    /// Explicit capture boundaries cannot be interpreted as lost key-up events.
+    /// Forget any held keys when pausing or leaving the diagnostics tab.
+    pub fn suspend(&mut self) {
+        self.held.clear();
+        self.previous_ticks = None;
+    }
+
     pub fn held_count(&self) -> usize { self.held.len() }
     pub fn stuck_candidates(&self, now: i64) -> Vec<(String, f64)> {
         self.held.values().filter_map(|key| {
@@ -182,6 +189,15 @@ mod tests {
         for x in 30..38 { d.event(key(x),format!("K{x}"),true,x as i64+1); }
         assert_eq!(d.maximum_simultaneous,8);
         assert_eq!(d.held_count(),8);
+    }
+    #[test]
+    fn capture_pause_does_not_report_phantom_stuck_key() {
+        let mut d = KeyboardDiagnostics::new(1_000_000);
+        d.event(key(30), "A".into(), true, 1_000_000);
+        d.suspend();
+        assert_eq!(d.held_count(), 0);
+        assert!(d.stuck_candidates(9_000_000).is_empty());
+        assert_eq!(d.downs, 1);
     }
     #[test]
     fn extended_scancode_keeps_keys_separate() {

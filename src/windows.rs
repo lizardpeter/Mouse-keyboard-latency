@@ -222,6 +222,8 @@ fn select_mode(hwnd:H,new_mode:usize){
         let mut cell=cell.borrow_mut();
         let Some(app)=cell.as_mut()else{return};
         app.session.break_pair();
+        if app.mode==2 && new_mode!=2 { app.keyboard.suspend(); }
+        if app.mode!=2 && new_mode==2 { app.keyboard.suspend(); }
         app.mode=new_mode;
         app.note=match new_mode{
             1=>"Mouse and Space events update live on this page.".into(),
@@ -390,6 +392,7 @@ fn toggle(){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             app.session.break_pair();
+            app.keyboard.suspend();
             app.active=!app.active;
             app.note=if app.active{
                 "Recording: press LEFT CLICK + SPACE, releasing both before repeating.".into()
