@@ -36,6 +36,29 @@ The display shows:
 
 Pausing and changing modes clear tracked held states so a key released outside the observation window will not incorrectly stay flagged forever. Reset mode also clears the diagnostic counts.
 
+## Collect one diagnostic report to investigate keyboard vs Windows
+
+**The one file to send for analysis is `keyboard_diagnostic_report.txt`.**
+
+1. Download and launch the latest Windows build from GitHub Actions.
+2. Open **2. Keyboard Diagnostics**, then click **Reset mode**.
+3. Try **individual keys**: press and fully release 20–30 times, including keys that feel unreliable.
+4. Try **several keys simultaneously**, then release every key. Watch whether the onscreen held list clears.
+5. Reproduce the suspected stuck-key / delayed-key event. After your fingers are off the keys, keep diagnostics running for at least **5 seconds**. This gives the monitor time to flag prolonged raw-vs-Windows state differences.
+6. While the anomaly is visible, click **Save Diagnostic Report**, confirm the privacy warning, and save the proposed `keyboard_diagnostic_report.txt` file. You may also save it if the issue did not occur—that's still useful negative evidence.
+7. **Read the file before sending it**. It records names of keys pressed, which can reveal typed content. Only use test inputs; avoid typing passwords, private messages or sensitive data while this mode is running. Then attach the report for analysis.
+
+The text report includes:
+- Windows version and QPC counter frequency;
+- overall key-down / key-up / repeat / unmatched-release totals;
+- the exact keys reported held *at the moment you clicked Save Diagnostic Report*;
+- time held, hold durations, queue delay estimates, and simultaneous-key counts;
+- **Raw Input versus `GetAsyncKeyState`** comparisons for keys that were observed during the session, with sustained (500+ ms) disagreements;
+- **every recorded diagnostic key event** (subject to a 250,000-event safety cap) with timestamps;
+- a place to record what you physically observed.
+
+**Caveat:** Windows asynchronous key state and Raw Input both depend on the operating system; they are not independent physical switch measurements. Key state polling may be unavailable or misleading on a secure desktop. A normal report also cannot guarantee that the keyboard hardware has no fault.
+
 ## Mode 3: Mouse Reaction Time
 
 1. Select **Mouse Reaction Time**, and click **Start trial**.
