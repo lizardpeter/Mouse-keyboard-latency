@@ -650,7 +650,7 @@ unsafe fn make_gui(hwnd:H){
         670,269,232,41,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     text(hwnd,instance,"RAW KEY-DOWN / KEY-UP COUNTS",32,314,870,25,f_medium);
     let counters=text(hwnd,instance,"",32,351,870,31,f_small);
-    text(hwnd,instance,"KEYS WINDOWS CURRENTLY REPORTS AS HELD",32,397,870,25,f_medium);
+    text(hwnd,instance,"KEYS RAW INPUT STILL REPORTS AS HELD",32,397,870,25,f_medium);
     let held=text(hwnd,instance,"",32,430,870,76,f_medium);
     text(hwnd,instance,"SUSPECTED EVENT ANOMALIES",32,527,870,28,f_medium);
     let alerts=text(hwnd,instance,"",32,562,870,48,f_small);
@@ -659,7 +659,7 @@ unsafe fn make_gui(hwnd:H){
     let os_state=text(hwnd,instance,"",32,680,870,27,f_small);
     text(hwnd,instance,"RECENT RAW KEY EVENTS",32,710,870,26,f_medium);
     let key_recent=text(hwnd,instance,"",32,739,870,140,f_small);
-    text(hwnd,instance,"A >3 s held state is a warning, not proof of a defective key. Missing physical input cannot be proven in software.",
+    text(hwnd,instance,"Only type test keys, never passwords. The saved report contains every key name observed.",
         32,891,870,24,f_small);
 
     CREATE_GROUP.with(|g|g.set(3));
