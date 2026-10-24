@@ -82,6 +82,7 @@ extern "system" {
     fn SendMessageW(hwnd:H,message:u32,wp:WP,lp:LP)->LP;
     fn SetTimer(hwnd:H,id:usize,period:u32,callback:H)->usize;
     fn KillTimer(hwnd:H,id:usize)->i32;
+    fn SetFocus(hwnd:H)->H;
     fn ShowWindow(hwnd:H,cmd:i32)->i32;
     fn UpdateWindow(hwnd:H)->i32;
     fn GetCursorPos(out:*mut Point)->i32;
@@ -332,6 +333,8 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
             match wp&0xFFFF{
                 ID_START=>toggle(),ID_RESET=>reset(),ID_SAVE=>save(hwnd),_=>{},
             }
+            // Space is the keyboard test input: never leave focus on a button.
+            SetFocus(hwnd);
             return 0;
         }
         WM_KEYDOWN if wp as u16==VK_F5=>{toggle();return 0;}
