@@ -2,6 +2,9 @@
 //! All UI events and Raw Input callbacks run on the owning GUI thread.
 
 use crate::core::{Kind, Session, DeviceSnapshot};
+use crate::keyboard::{KeyboardDiagnostics,KeyId};
+use crate::reaction::{ReactionTest,Phase};
+use std::cell::Cell;
 use std::{cell::RefCell, ffi::c_void, io, mem::{size_of, zeroed}, path::Path,
     ptr::{null, null_mut}};
 
@@ -12,7 +15,7 @@ type LP = isize;
 const WM_CREATE:u32=1; const WM_DESTROY:u32=2; const WM_COMMAND:u32=0x111;
 const WM_INPUT:u32=0xFF; const WM_TIMER:u32=0x113; const WM_SETFONT:u32=0x30;
 const WM_CTLCOLORSTATIC:u32=0x138; const WM_ERASEBKGND:u32=0x14;
-const WM_SIZE:u32=5; const WM_KEYDOWN:u32=0x100;
+const WM_SIZE:u32=5; const WM_KEYDOWN:u32=0x100; const WM_PAINT:u32=0x0F;
 const RIDEV_INPUTSINK:u32=0x100; const RID_INPUT:u32=0x10000003;
 const RI_MOUSE_LEFT_BUTTON_DOWN:u16=1; const RI_MOUSE_LEFT_BUTTON_UP:u16=2;
 const RI_KEY_BREAK:u16=1; const VK_SPACE:u16=0x20; const VK_F5:u16=0x74;
@@ -22,6 +25,8 @@ const WS_CAPTION:u32=0xC00000; const WS_SYSMENU:u32=0x80000;
 const WS_MINIMIZEBOX:u32=0x20000; const SS_LEFT:u32=0;
 const BS_PUSHBUTTON:u32=0; const SW_SHOW:i32=5;
 const ID_START:usize=101; const ID_RESET:usize=102; const ID_SAVE:usize=103;
+const ID_MODE_COMPARE:usize=201; const ID_MODE_KEYBOARD:usize=202;
+const ID_MODE_REACTION:usize=203; const ID_REACTION_ARM:usize=204;
 const FONT_NORMAL:i32=400; const FONT_BOLD:i32=700;
 const OFN_OVERWRITEPROMPT:u32=2; const OFN_PATHMUSTEXIST:u32=0x800;
 const ERROR_ICON:u32=0x10; const BLACK:u32=0x00251D18;
@@ -54,6 +59,13 @@ struct RawInput{header:RawHeader,data:RawData}
 #[derive(Default)]
 struct Point{x:i32,y:i32}
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct Rect { left:i32,top:i32,right:i32,bottom:i32 }
+#[repr(C)]
+struct Paint {
+    dc:H, erase:i32, region:Rect, restore:i32, update:i32, reserved:[u8;32]
+}
+#[repr(C)]
 struct Msg{hwnd:H,msg:u32,wp:WP,lp:LP,time:u32,point:Point,private:u32}
 #[repr(C)]
 struct SaveFile {
@@ -84,6 +96,12 @@ extern "system" {
     fn KillTimer(hwnd:H,id:usize)->i32;
     fn SetFocus(hwnd:H)->H;
     fn ShowWindow(hwnd:H,cmd:i32)->i32;
+    fn BeginPaint(hwnd:H,paint:*mut Paint)->H;
+    fn EndPaint(hwnd:H,paint:*const Paint)->i32;
+    fn InvalidateRect(hwnd:H,rect:*const Rect,erase:i32)->i32;
+    fn FillRect(dc:H,rect:*const Rect,brush:H)->i32;
+    fn DrawTextW(dc:H,text:*const u16,n:i32,rect:*mut Rect,format:u32)->i32;
+    fn GetClientRect(hwnd:H,r:*mut Rect)->i32;
     fn UpdateWindow(hwnd:H)->i32;
     fn GetCursorPos(out:*mut Point)->i32;
     fn ScreenToClient(hwnd:H,point:*mut Point)->i32;
@@ -115,8 +133,23 @@ struct Labels {
     count:H, mouse:H, keyboard:H, median:H,
     secondary:H, latest_pair:H, recent:H, notification:H,
 }
-struct State { session:Session, active:bool, labels:Option<Labels>, note:String }
-thread_local! { static STATE:RefCell<Option<State>>=const{RefCell::new(None)}; }
+struct KeyboardViews {
+    counters:H, held:H, alerts:H, durations:H, recent:H,
+}
+struct ReactionViews {
+    action:H, status:H, stats:H, last:H, recent:H,
+}
+struct State {
+    session:Session, active:bool, labels:Option<Labels>, note:String,
+    mode:usize, groups:[Vec<H>;4],
+    frequency:i64,
+    keyboard:KeyboardDiagnostics, key_views:Option<KeyboardViews>,
+    reaction:ReactionTest, reaction_views:Option<ReactionViews>,
+}
+thread_local! {
+    static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
+    static CREATE_GROUP:Cell<usize>=const{Cell::new(0)};
+}
 
 fn now()->i64 {let mut v=0; unsafe{QueryPerformanceCounter(&mut v);} v}
 unsafe fn control(parent:H,instance:H,class:&str,text:&str,id:usize,
@@ -124,6 +157,15 @@ unsafe fn control(parent:H,instance:H,class:&str,text:&str,id:usize,
     let hwnd=CreateWindowExW(0,wide(class).as_ptr(),wide(text).as_ptr(),
         WS_VISIBLE|WS_CHILD|style,x,y,w,h,parent,id as H,instance,null());
     if !font.is_null(){SendMessageW(hwnd,WM_SETFONT,font as usize,1);}
+    if !hwnd.is_null() {
+        CREATE_GROUP.with(|group|{
+            STATE.with(|cell|{
+                if let Some(app)=cell.borrow_mut().as_mut(){
+                    app.groups[group.get()].push(hwnd);
+                }
+            });
+        });
+    }
     hwnd
 }
 unsafe fn text(parent:H,instance:H,value:&str,x:i32,y:i32,w:i32,h:i32,font:H)->H{
@@ -151,6 +193,102 @@ fn show_device(snapshot: DeviceSnapshot, count:H, last:H, age:H, interval:H, uni
     set_text(interval, &snapshot.last_interval_ms.map_or_else(
         || "Press-to-press interval: —".to_string(),
         |ms| format!("Press-to-press interval: {ms:.3} ms")));
+}
+
+
+fn key_name(vk:u16,scan:u16,flags:u16)->String {
+    // Keep a useful label even if the active keyboard layout cannot name the key.
+    if (0x41..=0x5a).contains(&vk) || (0x30..=0x39).contains(&vk) {
+        return char::from_u32(vk as u32).unwrap().to_string();
+    }
+    match vk {
+        0x20=>"Space".into(),0x08=>"Backspace".into(),0x0d=>"Enter".into(),
+        0x09=>"Tab".into(),0x1b=>"Esc".into(),0x10=>"Shift".into(),
+        0x11=>"Ctrl".into(),0x12=>"Alt".into(),
+        0x25=>"Left".into(),0x26=>"Up".into(),0x27=>"Right".into(),0x28=>"Down".into(),
+        _=>{
+            let suffix=if flags&2!=0 {" E0"} else if flags&4!=0 {" E1"} else {""};
+            format!("VK 0x{vk:02X} / scan {scan:02X}{suffix}")
+        },
+    }
+}
+
+fn mode_title(m:usize)->&'static str {
+    match m { 1=>"1 · Input comparison",2=>"2 · Keyboard diagnostics",
+        3=>"3 · Mouse reaction time",_=>"Unknown" }
+}
+fn select_mode(hwnd:H,new_mode:usize){
+    STATE.with(|cell|{
+        let mut cell=cell.borrow_mut();
+        let Some(app)=cell.as_mut()else{return};
+        app.session.break_pair();
+        app.mode=new_mode;
+        app.note=match new_mode{
+            1=>"Mouse and Space events update live on this page.".into(),
+            2=>"Test key combinations; press and release keys to watch their states.".into(),
+            3=>"Click Start trial, wait for GREEN, then click the colored panel.".into(),
+            _=>String::new(),
+        };
+        for (i,group) in app.groups.iter().enumerate(){
+            if i==0{continue;}
+            for &handle in group {
+                unsafe{ShowWindow(handle,if i==new_mode {5}else{0});}
+            }
+        }
+    });
+    unsafe{InvalidateRect(hwnd,null(),1);}
+    refresh();
+}
+fn arm_reaction(hwnd:H){
+    STATE.with(|cell|{
+        if let Some(app)=cell.borrow_mut().as_mut(){
+            app.reaction.arm(now(),app.frequency);
+        }
+    });
+    unsafe{InvalidateRect(hwnd,null(),1);}
+    refresh();
+}
+fn paint_reaction(hwnd:H) {
+    // Paint submission is our local timing reference; physical display scan-out
+    // may occur later, so this is NOT photon-verified reaction time.
+    let mut ps:Paint=unsafe{zeroed()};
+    let dc=unsafe{BeginPaint(hwnd,&mut ps)};
+    if dc.is_null(){return;}
+    let (mode,phase)=STATE.with(|cell|{
+        let c=cell.borrow();
+        c.as_ref().map(|a|(a.mode,a.reaction.phase)).unwrap_or((0,Phase::Ready))
+    });
+    if mode==3 {
+        let client=unsafe{
+            let mut r:Rect=zeroed();
+            GetClientRect(hwnd,&mut r);
+            r
+        };
+        let mut rect=Rect{left:32,top:315,right:client.right-32,bottom:590};
+        let (bg,caption)=match phase {
+            Phase::Ready=>(0x00403532,"CLICK START TRIAL TO BEGIN"),
+            Phase::Waiting{..}=>(0x003C799C,"WAIT FOR GREEN — DO NOT CLICK"),
+            Phase::PendingPaint|Phase::Visible{..}=>(0x004EBC23,"CLICK NOW!"),
+            Phase::Complete{..}=>(0x004D443C,"TRIAL COMPLETE — START AGAIN"),
+            Phase::FalseStart=>(0x004C42DD,"TOO EARLY — FALSE START"),
+        };
+        unsafe{
+            let brush=CreateSolidBrush(bg);
+            FillRect(dc,&rect,brush);
+            DeleteObject(brush);
+            SetBkMode(dc,1);
+            SetTextColor(dc,0x00FFFFFF);
+            DrawTextW(dc,wide(caption).as_ptr(),-1,&mut rect,0x21|0x4);
+        }
+    }
+    unsafe{EndPaint(hwnd,&ps);}
+    if mode==3 && phase==Phase::PendingPaint{
+        STATE.with(|cell|{
+            if let Some(app)=cell.borrow_mut().as_mut(){
+                app.reaction.painted(now());
+            }
+        });
+    }
 }
 
 fn refresh() {
@@ -204,6 +342,48 @@ fn refresh() {
         }
         set_text(l.recent,&lines);
         set_text(l.notification,&app.note);
+        if let Some(k)=app.key_views.as_ref(){
+            let kd=&app.keyboard;
+            set_text(k.counters,&format!(
+                "Down: {}     Up: {}     Auto-repeats: {}     Unmatched key-ups: {}     Max held together: {}",
+                kd.downs,kd.ups,kd.repeats,kd.orphan_ups,kd.maximum_simultaneous));
+            set_text(k.held,&kd.held_display(timestamp));
+            set_text(k.alerts,&kd.alert_display(timestamp));
+            set_text(k.durations,&format!(
+                "Currently held: {}  |  Last down→up: {}  |  Longest: {:.1} ms  |  Shortest event gap: {}",
+                kd.held_count(),
+                kd.last_release_duration_ms.map_or_else(||"—".into(),|x|format!("{x:.1} ms")),
+                kd.max_release_duration_ms,
+                kd.shortest_gap_ms.map_or_else(||"—".into(),|x|format!("{x:.2} ms"))));
+            set_text(k.recent,&kd.log_display());
+        }
+        if let Some(r)=app.reaction_views.as_ref(){
+            let rx=&app.reaction;
+            let (status,caption)=match rx.phase {
+                Phase::Ready=>("Ready. Click Start trial to begin.","Start trial"),
+                Phase::Waiting{..}=>("Wait for GREEN; do not click early.","Waiting..."),
+                Phase::PendingPaint=>("Preparing the green signal...","Waiting..."),
+                Phase::Visible{..}=>("GREEN! Click the colored area NOW.","Waiting..."),
+                Phase::Complete{milliseconds}=>(
+                    if milliseconds < 100.0 {"Result recorded (very fast — check for anticipation)."}
+                    else {"Result recorded. Start another trial."},"Start next trial"),
+                Phase::FalseStart=>("False start: mouse clicked before green.","Try again"),
+            };
+            set_text(r.status,status);
+            set_text(r.action,caption);
+            set_text(r.last,&rx.last().map_or_else(||"Last result: —".into(),
+                |v|format!("Last result: {v:.1} ms")));
+            set_text(r.stats,&format!(
+                "Trials: {}       Average: {}       Best: {}       False starts: {}",
+                rx.results_ms.len(),
+                rx.average().map_or_else(||"—".into(),|v|format!("{v:.1} ms")),
+                rx.best().map_or_else(||"—".into(),|v|format!("{v:.1} ms")),
+                rx.false_starts));
+            let history=rx.results_ms.iter().enumerate().rev().take(10)
+                .map(|(i,v)|format!("Trial {:>2}      {:.1} ms",i+1,v))
+                .collect::<Vec<_>>().join("\r\n");
+            set_text(r.recent,&history);
+        }
     });
 }
 fn toggle(){
@@ -221,8 +401,13 @@ fn toggle(){
 fn reset(){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
-            app.session.reset(now());
-            app.note="All recorded pairs cleared.".into();
+            match app.mode{
+                2=>{app.keyboard=KeyboardDiagnostics::new(app.frequency);
+                    app.note="Keyboard diagnostics cleared.".into();},
+                3=>{app.reaction.reset();
+                    app.note="Reaction results cleared.".into();},
+                _=>{app.session.reset(now());app.note="Input comparison reset.".into();}
+            }
         }
     });
     refresh();
