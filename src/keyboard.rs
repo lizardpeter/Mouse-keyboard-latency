@@ -176,6 +176,7 @@ impl KeyboardDiagnostics {
     /// Forget any held keys when pausing or leaving the diagnostics tab.
     pub fn suspend(&mut self) {
         self.held.clear();
+        self.observed_vks.clear();
         self.previous_ticks = None;
     }
 
@@ -316,6 +317,16 @@ impl KeyboardDiagnostics {
             "Sampled GetAsyncKeyState approximately every 50 ms; comparisons were restricted to observed keys.");
         let _ = writeln!(report,
             "Left/right aggregate modifiers are excluded to avoid false disagreements.");
+        let _ = writeln!(report,"Latest sampled state of observed virtual keys:");
+        if os_state.latest_states.is_empty() {
+            let _ = writeln!(report,"No Windows key-state samples available.");
+        }
+        for (vk, observed) in &os_state.latest_states {
+            let _ = writeln!(report,
+                "key={} vk={} raw_held={} windows_async_held={} sample_t_ms={:.1}",
+                observed.label, vk, observed.raw_down, observed.os_down, observed.time_ms);
+        }
+        let _ = writeln!(report, "Sustained state-mismatch episodes:");
         if os_state.disagreements.is_empty() {
             let _ = writeln!(report, "No sustained mismatch episodes confirmed.");
         }
@@ -399,6 +410,13 @@ pub struct OsDisagreement {
     pub duration_ms: f64,
 }
 #[derive(Clone, Debug)]
+pub struct LatestOsKeyState {
+    pub label: String,
+    pub raw_down: bool,
+    pub os_down: bool,
+    pub time_ms: f64,
+}
+#[derive(Clone, Debug)]
 struct PendingMismatch {
     first_tick: i64,
     raw_down: bool,
@@ -411,6 +429,7 @@ pub struct OsKeyStateMonitor {
     base_ticks: i64,
     frequency: i64,
     pending: BTreeMap<u16, PendingMismatch>,
+    pub latest_states: BTreeMap<u16, LatestOsKeyState>,
     pub samples: u64,
     pub mismatching_samples: u64,
     pub confirmed_disagreements: u64,
@@ -425,10 +444,16 @@ impl OsKeyStateMonitor {
 
     pub fn clear_pending(&mut self) {
         self.pending.clear();
+        self.latest_states.clear();
     }
 
     pub fn sample(&mut self, vk: u16, label: &str, raw_down: bool, os_down: bool, ticks: i64) {
         self.samples += 1;
+        let time_ms = ticks.saturating_sub(self.base_ticks) as f64 * 1000.0
+            / self.frequency as f64;
+        self.latest_states.insert(vk,LatestOsKeyState{
+            label:label.to_owned(),raw_down,os_down,time_ms,
+        });
         if raw_down == os_down {
             self.pending.remove(&vk);
             return;
@@ -481,6 +506,7 @@ mod tests {
         let report = kb.build_report(3_250_000, &os, "Windows test");
         assert!(report.contains("Confirmed Raw-vs-Windows key-state disagreements (>= 500 ms): 1"));
         assert!(report.contains("A scan=30"));
+        assert!(report.contains("windows_async_held=false"));
         assert!(report.contains("t=601.00 ms"));
         assert!(report.contains("FULL RAW INPUT KEYBOARD EVENT TIMELINE"));
         assert!(report.contains("*LONG HELD*"));
