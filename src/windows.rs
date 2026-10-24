@@ -1,7 +1,7 @@
 //! Native Win32 GUI and Windows Raw Input capture. No external dependencies.
 //! All UI events and Raw Input callbacks run on the owning GUI thread.
 
-use crate::core::Session;
+use crate::core::{Kind, Session, DeviceSnapshot};
 use std::{cell::RefCell, ffi::c_void, io, mem::{size_of, zeroed}, path::Path,
     ptr::{null, null_mut}};
 
@@ -109,8 +109,11 @@ extern "system" {
 }
 
 struct Labels {
-    start:H, recording:H, count:H, mouse:H, keyboard:H, median:H,
-    secondary:H, recent:H, notification:H,
+    start:H, recording:H,
+    mouse_count:H, mouse_last:H, mouse_age:H, mouse_interval:H,
+    key_count:H, key_last:H, key_age:H, key_interval:H,
+    count:H, mouse:H, keyboard:H, median:H,
+    secondary:H, latest_pair:H, recent:H, notification:H,
 }
 struct State { session:Session, active:bool, labels:Option<Labels>, note:String }
 thread_local! { static STATE:RefCell<Option<State>>=const{RefCell::new(None)}; }
@@ -131,11 +134,35 @@ unsafe fn font(height:i32,weight:i32)->H {
     CreateFontW(-height,0,0,0,weight,0,0,0,1,0,0,5,0,wide("Segoe UI").as_ptr())
 }
 
+
+fn format_age(value: Option<f64>) -> String {
+    match value {
+        Some(ms) if ms < 1000.0 => format!("{ms:.0} ms ago"),
+        Some(ms) => format!("{:.2} s ago", ms / 1000.0),
+        None => "No input yet".into(),
+    }
+}
+
+fn show_device(snapshot: DeviceSnapshot, count:H, last:H, age:H, interval:H, unit:&str) {
+    set_text(count, &format!("{} {}", snapshot.press_count, unit));
+    set_text(last, &snapshot.last_event_ms.map_or_else(|| "Last event: —".to_string(),
+        |ms| format!("Last event: {ms:.3} ms after start")));
+    set_text(age, &format!("Seen: {}", format_age(snapshot.age_ms)));
+    set_text(interval, &snapshot.last_interval_ms.map_or_else(
+        || "Press-to-press interval: —".to_string(),
+        |ms| format!("Press-to-press interval: {ms:.3} ms")));
+}
+
 fn refresh() {
     STATE.with(|cell|{
         let state=cell.borrow();
         let Some(app)=state.as_ref() else{return;};
         let Some(l)=app.labels.as_ref() else{return;};
+        let timestamp = now();
+        show_device(app.session.device_snapshot(Kind::Mouse, timestamp),
+            l.mouse_count,l.mouse_last,l.mouse_age,l.mouse_interval,"clicks");
+        show_device(app.session.device_snapshot(Kind::Keyboard, timestamp),
+            l.key_count,l.key_last,l.key_age,l.key_interval,"key presses");
         set_text(l.start,if app.active {"Pause"} else {"Start recording"});
         set_text(l.recording,if app.active {"●  RECORDING  ·  Input is being captured"}
             else {"●  PAUSED  ·  Press Start recording"});
@@ -152,7 +179,18 @@ fn refresh() {
             s.mean_signed_ms,s.p95_absolute_ms,
             100.0*s.mouse_first as f64/s.count as f64,
             100.0*s.keyboard_first as f64/s.count as f64));
+
         set_text(l.secondary,&details);
+        let latest = app.session.trials().last().map_or_else(
+            || "Latest matched pair: waiting for a click + Space".to_string(),
+            |t| {
+                let delta = t.keyboard_minus_mouse_ms;
+                let first = if delta > 0.0 {"mouse first"} else if delta < 0.0 {"keyboard first"}
+                    else {"same timestamp"};
+                format!("Latest pair #{}: {:+.3} ms   ({first})",t.number,delta)
+            },
+        );
+        set_text(l.latest_pair,&latest);
         let mut lines=String::from("TRIAL              FIRST INPUT              SIGNED GAP\r\n\
             ─────────────────────────────────────────────────\r\n");
         for t in app.session.trials().iter().rev().take(9) {
@@ -162,7 +200,7 @@ fn refresh() {
                 t.number,first,t.keyboard_minus_mouse_ms));
         }
         if app.session.trial_count()==0{
-            lines.push_str("\r\nClick Start recording, then click the mouse and press Space closely together.");
+            lines.push_str("\r\nPress the left mouse button and Space close together to compare arrival times.");
         }
         set_text(l.recent,&lines);
         set_text(l.notification,&app.note);
@@ -243,48 +281,67 @@ unsafe fn make_gui(hwnd:H){
     let f_medium=font(17,FONT_BOLD);
     let f_large=font(29,FONT_BOLD);
     let f_title=font(28,FONT_BOLD);
-    text(hwnd,instance,"INPUT TIMING LAB",30,21,745,47,f_title);
+
+    text(hwnd,instance,"INPUT TIMING LAB",30,19,830,45,f_title);
     text(hwnd,instance,
-        "MOUSE LEFT CLICK  vs.  KEYBOARD SPACE   •   Windows Raw Input / QueryPerformanceCounter",
-        32,71,735,22,f_small);
-    let start=control(hwnd,instance,"BUTTON","Start recording",ID_START,
-        31,111,175,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        "LIVE MOUSE + KEYBOARD  •  Raw Input timestamps  •  Results appear automatically",
+        32,68,880,26,f_small);
+    let start=control(hwnd,instance,"BUTTON","Pause",ID_START,
+        31,108,165,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     control(hwnd,instance,"BUTTON","Reset",ID_RESET,
-        220,111,110,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    control(hwnd,instance,"BUTTON","Save CSV...",ID_SAVE,
-        343,111,130,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    let recording=text(hwnd,instance,"",494,117,350,29,f_medium);
+        211,108,111,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","Export CSV",ID_SAVE,
+        338,108,130,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    let recording=text(hwnd,instance,"",482,112,418,32,f_medium);
 
-    text(hwnd,instance,"COMPLETED PAIRS",32,184,200,23,f_small);
-    text(hwnd,instance,"MOUSE FIRST",230,184,190,23,f_small);
-    text(hwnd,instance,"KEYBOARD FIRST",428,184,190,23,f_small);
-    text(hwnd,instance,"MEDIAN ABSOLUTE GAP",631,184,213,23,f_small);
-    let count=text(hwnd,instance,"0",32,215,184,53,f_large);
-    let mouse=text(hwnd,instance,"0",230,215,184,53,f_large);
-    let keyboard=text(hwnd,instance,"0",428,215,184,53,f_large);
-    let median=text(hwnd,instance,"—",631,215,213,53,f_large);
+    // Each input panel updates on its own, even when no matched pair exists.
+    text(hwnd,instance,"MOUSE · LEFT CLICK",32,173,395,30,f_medium);
+    text(hwnd,instance,"KEYBOARD · SPACE",489,173,395,30,f_medium);
+    let mouse_count=text(hwnd,instance,"0 clicks",32,205,410,51,f_large);
+    let key_count=text(hwnd,instance,"0 key presses",489,205,410,51,f_large);
 
-    text(hwnd,instance,"DETAILED STATISTICS",32,291,400,25,f_medium);
-    let secondary=text(hwnd,instance,"",32,327,812,33,f_small);
-    text(hwnd,instance,"MOST RECENT INPUT PAIRS",32,375,400,25,f_medium);
-    let recent=text(hwnd,instance,"",32,410,812,235,f_small);
+    let mouse_last=text(hwnd,instance,"Last event: —",32,267,430,26,f_small);
+    let key_last=text(hwnd,instance,"Last event: —",489,267,420,26,f_small);
+    let mouse_age=text(hwnd,instance,"Seen: No input yet",32,294,430,25,f_small);
+    let key_age=text(hwnd,instance,"Seen: No input yet",489,294,420,25,f_small);
+    let mouse_interval=text(hwnd,instance,"Press-to-press interval: —",32,321,430,26,f_small);
+    let key_interval=text(hwnd,instance,"Press-to-press interval: —",489,321,420,26,f_small);
+
+    text(hwnd,instance,"LIVE MOUSE / KEYBOARD COMPARISON",32,369,840,30,f_medium);
+    text(hwnd,instance,"MATCHED PAIRS",32,411,200,22,f_small);
+    text(hwnd,instance,"MOUSE FIRST",247,411,194,22,f_small);
+    text(hwnd,instance,"KEYBOARD FIRST",470,411,190,22,f_small);
+    text(hwnd,instance,"MEDIAN GAP",697,411,188,22,f_small);
+    let count=text(hwnd,instance,"0",32,439,180,49,f_large);
+    let mouse=text(hwnd,instance,"0",247,439,180,49,f_large);
+    let keyboard=text(hwnd,instance,"0",470,439,180,49,f_large);
+    let median=text(hwnd,instance,"—",697,439,200,49,f_large);
+
+    let latest_pair=text(hwnd,instance,"Latest matched pair: waiting for input",32,502,875,28,f_medium);
+    let secondary=text(hwnd,instance,"",32,535,875,30,f_small);
+
+    text(hwnd,instance,"RECENT PAIRED RESULTS (LIVE)",32,588,820,27,f_medium);
+    let recent=text(hwnd,instance,"",32,621,865,174,f_small);
     text(hwnd,instance,
-        "Positive gap = MOUSE first   •   Negative gap = KEYBOARD first   •   F5 = pause/resume",
-        32,652,810,25,f_small);
-    let notification=text(hwnd,instance,"",32,687,800,33,f_small);
+        "Positive = mouse first  •  Negative = keyboard first  •  F5 = pause/resume",
+        32,805,875,24,f_small);
+    let notification=text(hwnd,instance,"",32,832,870,24,f_small);
     text(hwnd,instance,
-        "Measured: application-observed arrival time. This is not absolute hardware latency.",
-        32,731,812,24,f_small);
+        "Single-device intervals are NOT input latency. Comparisons measure Windows app arrival times, not hardware lag.",
+        32,858,885,22,f_small);
 
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             app.labels=Some(Labels{
-                start,recording,count,mouse,keyboard,median,secondary,recent,notification
+                start,recording,
+                mouse_count,mouse_last,mouse_age,mouse_interval,
+                key_count,key_last,key_age,key_interval,
+                count,mouse,keyboard,median,secondary,latest_pair,recent,notification,
             });
         }
     });
     refresh();
-    // Fonts are intentionally process-lifetime resources; statics retain references.
+    // Fonts are intentionally retained until this short-lived process exits.
 }
 
 unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
@@ -359,8 +416,8 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
     }
     STATE.with(|cell|{
         *cell.borrow_mut()=Some(State{
-            session:Session::new(now(),frequency),active:false,labels:None,
-            note:"Ready. Your capture remains on this computer.".into(),
+            session:Session::new(now(),frequency),active:true,labels:None,
+            note:"LIVE capture is ON. Click and press Space to see instant results above.".into(),
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");
@@ -375,7 +432,7 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
         }
         let hwnd=CreateWindowExW(0,cls.as_ptr(),title.as_ptr(),
             WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_VISIBLE,
-            100,90,884,810,null_mut(),null_mut(),instance,null());
+            100,45,950,934,null_mut(),null_mut(),instance,null());
         if hwnd.is_null(){return Err(io::Error::last_os_error().into());}
         let devices=[
             RawDevice{page:1,usage:2,flags:RIDEV_INPUTSINK,hwnd},
@@ -385,7 +442,8 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             let e=io::Error::last_os_error();error(hwnd,&format!("Raw Input: {e}"));
             DestroyWindow(hwnd);return Err(e.into());
         }
-        SetTimer(hwnd,1,120,null_mut());
+        // 20 Hz display refresh; timestamps remain captured immediately on input.
+        SetTimer(hwnd,1,50,null_mut());
         ShowWindow(hwnd,SW_SHOW);UpdateWindow(hwnd);
         let mut m:Msg=zeroed();
         loop{
