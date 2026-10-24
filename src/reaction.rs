@@ -1,6 +1,8 @@
 //! Pure reaction-time trial state machine.
 //! Stimulus time is the moment GUI drawing was submitted, NOT photons on screen.
 
+use std::{fs::File, io::{self, BufWriter, Write}, path::Path};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Phase {
     Ready,
@@ -73,12 +75,39 @@ impl ReactionTest {
     pub fn best(&self)->Option<f64> {
         self.results_ms.iter().copied().reduce(f64::min)
     }
+    pub fn save_csv(&self, path: &Path) -> io::Result<()> {
+        let mut out = BufWriter::new(File::create(path)?);
+        writeln!(out, "record_type,trial_number,reaction_time_ms,metric,value")?;
+        for (index, value) in self.results_ms.iter().enumerate() {
+            writeln!(out, "trial,{},{:.3},,", index + 1, value)?;
+        }
+        writeln!(out, "summary,,,valid_trials,{}", self.results_ms.len())?;
+        writeln!(out, "summary,,,false_starts,{}", self.false_starts)?;
+        writeln!(out, "summary,,,mean_reaction_ms,{}", self.average().map_or(String::new(),|n|format!("{n:.3}")))?;
+        writeln!(out, "summary,,,best_reaction_ms,{}", self.best().map_or(String::new(),|n|format!("{n:.3}")))?;
+        out.flush()
+    }
     pub fn last(&self)->Option<f64> { self.results_ms.last().copied() }
 }
 
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn exports_reaction_trials_and_false_starts() {
+        let mut r=ReactionTest::default();
+        r.arm_with_delay(0,1_000_000,1000);
+        r.tick(1_000_000);r.painted(1_000_000);
+        r.click(1_247_000,1_000_000);
+        r.arm_with_delay(2_000_000,1_000_000,1500);
+        r.click(2_100_000,1_000_000);
+        let file=std::env::temp_dir().join(format!("reaction_export_{}.csv",std::process::id()));
+        r.save_csv(&file).unwrap();
+        let contents=std::fs::read_to_string(&file).unwrap();
+        let _=std::fs::remove_file(file);
+        assert!(contents.contains("trial,1,247.000"));
+        assert!(contents.contains("summary,,,false_starts,1"));
+    }
     #[test]
     fn stimulus_requires_actual_paint_mark_before_valid_click(){
         let mut r=ReactionTest::default();
