@@ -32,6 +32,7 @@ const BS_PUSHBUTTON:u32=0; const SW_SHOW:i32=5;
 const ID_START:usize=101; const ID_RESET:usize=102; const ID_SAVE:usize=103;
 const ID_DIAGNOSTIC_REPORT:usize=105;
 const ID_TYPING_INPUT:usize=306;
+const ID_TYPING_TEXTLOG:usize=307; const ID_TYPING_RAWLOG:usize=308;
 const ID_MODE_COMPARE:usize=201; const ID_MODE_KEYBOARD:usize=202;
 const ID_MODE_REACTION:usize=203; const ID_REACTION_ARM:usize=204;
 const ID_MODE_TYPING:usize=205;
@@ -774,10 +775,10 @@ unsafe fn make_gui(hwnd:H){
     let typing_stats=text(hwnd,instance,"",32,550,870,27,f_small);
     let typing_gap=text(hwnd,instance,"",32,579,870,27,f_small);
     text(hwnd,instance,"ACTUAL WINDOWS WM_CHAR ARRIVAL TIMELINE (latest below)",32,621,870,27,f_medium);
-    let typed_chars=control(hwnd,instance,"EDIT","",0,
+    let typed_chars=control(hwnd,instance,"EDIT","",ID_TYPING_TEXTLOG,
         32,653,870,115,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
     text(hwnd,instance,"RAW INPUT ARRIVALS — compare key-down / key-up / repeat timing",32,782,870,26,f_medium);
-    let typed_raw=control(hwnd,instance,"EDIT","",0,
+    let typed_raw=control(hwnd,instance,"EDIT","",ID_TYPING_RAWLOG,
         32,813,870,105,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
 
     CREATE_GROUP.with(|g|g.set(0));
@@ -873,7 +874,7 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
         }
         WM_COMMAND=>{
             let id=wp&0xFFFF;
-            if id==ID_TYPING_INPUT {
+            if id==ID_TYPING_INPUT || id==ID_TYPING_TEXTLOG || id==ID_TYPING_RAWLOG {
                 // EN_CHANGE and other notifications must NOT steal textbox
                 // focus. The user must be able to type continuously.
                 return 0;
