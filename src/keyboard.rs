@@ -37,6 +37,10 @@ pub struct KeyboardDiagnostics {
     pub repeats: u64,
     pub orphan_ups: u64,
     pub maximum_simultaneous: usize,
+    /// Approximate age of Raw Input's Windows message when the handler runs.
+    pub latest_queue_age_ms: Option<u32>,
+    pub largest_queue_age_ms: u32,
+    pub slow_queue_events: u64,
     pub last_event_ms: Option<f64>,
     pub last_release_duration_ms: Option<f64>,
     pub max_release_duration_ms: f64,
@@ -110,6 +114,15 @@ impl KeyboardDiagnostics {
     pub fn suspend(&mut self) {
         self.held.clear();
         self.previous_ticks = None;
+    }
+
+    pub fn observe_queue_age(&mut self, milliseconds: u32) {
+        // GETMESSAGETIME is only millisecond resolution and may be platform dependent.
+        // Discard unreasonable values caused by wrap/timestamp mismatch.
+        if milliseconds > 5_000 { return; }
+        self.latest_queue_age_ms = Some(milliseconds);
+        self.largest_queue_age_ms = self.largest_queue_age_ms.max(milliseconds);
+        if milliseconds >= 32 { self.slow_queue_events += 1; }
     }
 
     pub fn held_count(&self) -> usize { self.held.len() }
@@ -189,6 +202,16 @@ mod tests {
         for x in 30..38 { d.event(key(x),format!("K{x}"),true,x as i64+1); }
         assert_eq!(d.maximum_simultaneous,8);
         assert_eq!(d.held_count(),8);
+    }
+    #[test]
+    fn queue_age_is_separate_from_hardware_latency() {
+        let mut d=KeyboardDiagnostics::new(1_000_000);
+        d.observe_queue_age(4);
+        d.observe_queue_age(36);
+        d.observe_queue_age(u32::MAX);
+        assert_eq!(d.latest_queue_age_ms,Some(36));
+        assert_eq!(d.largest_queue_age_ms,36);
+        assert_eq!(d.slow_queue_events,1);
     }
     #[test]
     fn capture_pause_does_not_report_phantom_stuck_key() {

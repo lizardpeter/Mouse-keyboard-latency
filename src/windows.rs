@@ -106,6 +106,7 @@ extern "system" {
     fn GetCursorPos(out:*mut Point)->i32;
     fn ScreenToClient(hwnd:H,point:*mut Point)->i32;
     fn MessageBoxW(hwnd:H,text:*const u16,caption:*const u16,flags:u32)->i32;
+    fn GetMessageTime()->i32;
     fn SetBkMode(dc:H,mode:i32)->i32;
     fn SetTextColor(dc:H,color:u32)->u32;
 }
@@ -122,6 +123,7 @@ extern "system" { fn GetSaveFileNameW(data:*mut SaveFile)->i32; }
 #[link(name="kernel32")]
 extern "system" {
     fn GetModuleHandleW(name:*const u16)->H;
+    fn GetTickCount64()->u64;
     fn QueryPerformanceFrequency(out:*mut i64)->i32;
     fn QueryPerformanceCounter(out:*mut i64)->i32;
 }
@@ -134,7 +136,7 @@ struct Labels {
     secondary:H, latest_pair:H, recent:H, notification:H,
 }
 struct KeyboardViews {
-    counters:H, held:H, alerts:H, durations:H, recent:H,
+    counters:H, held:H, alerts:H, durations:H, queue:H, recent:H,
 }
 struct ReactionViews {
     action:H, status:H, stats:H, last:H, recent:H,
@@ -357,6 +359,10 @@ fn refresh() {
                 kd.last_release_duration_ms.map_or_else(||"—".into(),|x|format!("{x:.1} ms")),
                 kd.max_release_duration_ms,
                 kd.shortest_gap_ms.map_or_else(||"—".into(),|x|format!("{x:.2} ms"))));
+            set_text(k.queue,&format!(
+                "Windows message queue age (approx.): latest {}  |  worst {} ms  |  ≥32 ms delays: {}",
+                kd.latest_queue_age_ms.map_or_else(||"—".into(),|x|format!("{x} ms")),
+                kd.largest_queue_age_ms, kd.slow_queue_events));
             set_text(k.recent,&kd.log_display());
         }
         if let Some(r)=app.reaction_views.as_ref(){
@@ -528,9 +534,10 @@ unsafe fn make_gui(hwnd:H){
     let held=text(hwnd,instance,"",32,430,870,76,f_medium);
     text(hwnd,instance,"SUSPECTED EVENT ANOMALIES",32,527,870,28,f_medium);
     let alerts=text(hwnd,instance,"",32,562,870,48,f_small);
-    let durations=text(hwnd,instance,"",32,618,870,36,f_small);
-    text(hwnd,instance,"RECENT RAW KEY EVENTS",32,673,870,27,f_medium);
-    let key_recent=text(hwnd,instance,"",32,710,870,175,f_small);
+    let durations=text(hwnd,instance,"",32,614,870,33,f_small);
+    let queue=text(hwnd,instance,"",32,651,870,26,f_small);
+    text(hwnd,instance,"RECENT RAW KEY EVENTS",32,690,870,27,f_medium);
+    let key_recent=text(hwnd,instance,"",32,721,870,155,f_small);
     text(hwnd,instance,"A >3 s held state is a warning, not proof of a defective key. Missing physical input cannot be proven in software.",
         32,891,870,24,f_small);
 
@@ -557,7 +564,7 @@ unsafe fn make_gui(hwnd:H){
                 key_count,key_last,key_age,key_interval,
                 count,mouse,keyboard,median,secondary,latest_pair,recent,notification,
             });
-            app.key_views=Some(KeyboardViews{counters,held,alerts,durations,recent:key_recent});
+            app.key_views=Some(KeyboardViews{counters,held,alerts,durations,queue,recent:key_recent});
             app.reaction_views=Some(ReactionViews{
                 action:arm_button,
                 status,stats:rx_stats,last,recent:rx_recent,
@@ -616,6 +623,8 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                             } else if app.mode==2 {
                                 let scan=if key.make==0{key.key}else{key.make};
                                 let id=KeyId::new(scan,key.flags);
+                                let delay=(GetTickCount64() as u32).wrapping_sub(GetMessageTime() as u32);
+                                app.keyboard.observe_queue_age(delay);
                                 app.keyboard.event(id,key_name(key.key,scan,key.flags),down,tick);
                             }
                         }
