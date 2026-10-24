@@ -4,6 +4,7 @@
 use crate::core::{Kind, Session, DeviceSnapshot};
 use crate::keyboard::{KeyboardDiagnostics,KeyId,OsKeyStateMonitor};
 use crate::reaction::{ReactionTest,Phase};
+use crate::typing::TypingMonitor;
 use std::cell::Cell;
 use std::{cell::RefCell, ffi::c_void, io, mem::{size_of, zeroed}, path::Path,
     ptr::{null, null_mut}};
@@ -16,6 +17,10 @@ const WM_CREATE:u32=1; const WM_DESTROY:u32=2; const WM_COMMAND:u32=0x111;
 const WM_INPUT:u32=0xFF; const WM_TIMER:u32=0x113; const WM_SETFONT:u32=0x30;
 const WM_CTLCOLORSTATIC:u32=0x138; const WM_ERASEBKGND:u32=0x14;
 const WM_SIZE:u32=5; const WM_KEYDOWN:u32=0x100; const WM_PAINT:u32=0x0F;
+const WM_CHAR:u32=0x102; const GWLP_WNDPROC:i32=-4;
+const WS_VSCROLL:u32=0x00200000;
+const ES_MULTILINE:u32=0x0004; const ES_AUTOVSCROLL:u32=0x0040;
+const ES_WANTRETURN:u32=0x1000; const ES_READONLY:u32=0x0800;
 const RIDEV_INPUTSINK:u32=0x100; const RID_INPUT:u32=0x10000003;
 const RI_MOUSE_LEFT_BUTTON_DOWN:u16=1; const RI_MOUSE_LEFT_BUTTON_UP:u16=2;
 const RI_KEY_BREAK:u16=1; const VK_SPACE:u16=0x20; const VK_F5:u16=0x74;
@@ -26,8 +31,10 @@ const WS_MINIMIZEBOX:u32=0x20000; const SS_LEFT:u32=0;
 const BS_PUSHBUTTON:u32=0; const SW_SHOW:i32=5;
 const ID_START:usize=101; const ID_RESET:usize=102; const ID_SAVE:usize=103;
 const ID_DIAGNOSTIC_REPORT:usize=105;
+const ID_TYPING_INPUT:usize=306;
 const ID_MODE_COMPARE:usize=201; const ID_MODE_KEYBOARD:usize=202;
 const ID_MODE_REACTION:usize=203; const ID_REACTION_ARM:usize=204;
+const ID_MODE_TYPING:usize=205;
 const FONT_NORMAL:i32=400; const FONT_BOLD:i32=700;
 const OFN_OVERWRITEPROMPT:u32=2; const OFN_PATHMUSTEXIST:u32=0x800;
 const ERROR_ICON:u32=0x10; const BLACK:u32=0x00251D18;
@@ -92,6 +99,10 @@ extern "system" {
     fn RegisterRawInputDevices(devices:*const RawDevice,count:u32,size:u32)->i32;
     fn GetRawInputData(handle:H,command:u32,out:H,bytes:*mut u32,header:u32)->u32;
     fn SetWindowTextW(hwnd:H,text:*const u16)->i32;
+    fn SetWindowLongPtrW(hwnd:H,index:i32,new_ptr:isize)->isize;
+    fn CallWindowProcW(prev:isize,hwnd:H,msg:u32,wp:WP,lp:LP)->LP;
+    fn GetWindowTextLengthW(hwnd:H)->i32;
+    fn GetWindowTextW(hwnd:H,out:*mut u16,length:i32)->i32;
     fn SendMessageW(hwnd:H,message:u32,wp:WP,lp:LP)->LP;
     fn SetTimer(hwnd:H,id:usize,period:u32,callback:H)->usize;
     fn KillTimer(hwnd:H,id:usize)->i32;
@@ -164,17 +175,22 @@ struct KeyboardViews {
 struct ReactionViews {
     action:H, status:H, stats:H, last:H, recent:H,
 }
+struct TypingViews {
+    input:H, stats:H, last_gap:H, text_log:H, raw_log:H,
+}
 struct State {
     session:Session, active:bool, labels:Option<Labels>, note:String,
-    mode:usize, groups:[Vec<H>;4],
+    mode:usize, groups:[Vec<H>;5],
     frequency:i64,
     keyboard:KeyboardDiagnostics, os_keys:OsKeyStateMonitor,
     key_views:Option<KeyboardViews>,
     reaction:ReactionTest, reaction_views:Option<ReactionViews>,
+    typing:TypingMonitor, typing_views:Option<TypingViews>,
 }
 thread_local! {
     static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
     static CREATE_GROUP:Cell<usize>=const{Cell::new(0)};
+    static ORIGINAL_TYPING_PROC:Cell<isize>=const{Cell::new(0)};
 }
 
 fn now()->i64 {let mut v=0; unsafe{QueryPerformanceCounter(&mut v);} v}
@@ -198,6 +214,30 @@ unsafe fn text(parent:H,instance:H,value:&str,x:i32,y:i32,w:i32,h:i32,font:H)->H
     control(parent,instance,"STATIC",value,0,x,y,w,h,SS_LEFT,font)
 }
 fn set_text(hwnd:H,value:&str){if !hwnd.is_null(){unsafe{SetWindowTextW(hwnd,wide(value).as_ptr());}}}
+fn get_text(hwnd:H)->String {
+    if hwnd.is_null(){return String::new();}
+    let cap=unsafe{GetWindowTextLengthW(hwnd)}.max(0) as usize;
+    let mut buf=vec![0u16;cap.min(32768)+1];
+    let read=unsafe{GetWindowTextW(hwnd,buf.as_mut_ptr(),buf.len() as i32)}.max(0) as usize;
+    String::from_utf16_lossy(&buf[..read])
+}
+/// Observe real character messages delivered to the native test EDIT control.
+/// Only this specific, focused textbox is subclassed; no global Windows hooks.
+unsafe extern "system" fn typing_edit_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP {
+    if msg==WM_CHAR {
+        let tick=now();
+        STATE.with(|cell|{
+            if let Some(app)=cell.borrow_mut().as_mut(){
+                if app.mode==4 && app.active {
+                    app.typing.character(wp as u16,tick);
+                }
+            }
+        });
+    }
+    let original=ORIGINAL_TYPING_PROC.with(Cell::get);
+    if original!=0 {CallWindowProcW(original,hwnd,msg,wp,lp)}
+    else {DefWindowProcW(hwnd,msg,wp,lp)}
+}
 unsafe fn font(height:i32,weight:i32)->H {
     CreateFontW(-height,0,0,0,weight,0,0,0,1,0,0,5,0,wide("Segoe UI").as_ptr())
 }
@@ -241,26 +281,24 @@ fn key_name(vk:u16,scan:u16,flags:u16)->String {
 
 fn mode_title(m:usize)->&'static str {
     match m { 1=>"1 · Input comparison",2=>"2 · Keyboard diagnostics",
-        3=>"3 · Mouse reaction time",_=>"Unknown" }
+        3=>"3 · Mouse reaction time",4=>"4 · Typing test",_=>"Unknown" }
 }
 fn select_mode(hwnd:H,new_mode:usize){
     STATE.with(|cell|{
         let mut cell=cell.borrow_mut();
         let Some(app)=cell.as_mut()else{return};
         app.session.break_pair();
-        if app.mode==2 && new_mode!=2 {
+        if app.mode!=new_mode && (app.mode==2 || app.mode==4 || new_mode==2 || new_mode==4) {
             app.keyboard.suspend();
             app.os_keys.clear_pending();
-        }
-        if app.mode!=2 && new_mode==2 {
-            app.keyboard.suspend();
-            app.os_keys.clear_pending();
+            app.typing.suspend();
         }
         app.mode=new_mode;
         app.note=match new_mode{
             1=>"Mouse and Space events update live on this page.".into(),
             2=>"Test key combinations; press and release keys to watch their states.".into(),
             3=>"Click Start trial, wait for GREEN, then click the colored panel.".into(),
+            4=>"Click the typing box and type test text. Watch both WM_CHAR and Raw Input timings.".into(),
             _=>String::new(),
         };
         for (i,group) in app.groups.iter().enumerate(){
@@ -271,6 +309,15 @@ fn select_mode(hwnd:H,new_mode:usize){
         }
     });
     unsafe{InvalidateRect(hwnd,null(),1);}
+    if new_mode==4 {
+        STATE.with(|cell|{
+            if let Some(app)=cell.borrow().as_ref(){
+                if let Some(view)=app.typing_views.as_ref() {
+                    unsafe{SetFocus(view.input);}
+                }
+            }
+        });
+    }
     refresh();
 }
 fn arm_reaction(hwnd:H){
@@ -376,6 +423,17 @@ fn refresh() {
         }
         set_text(l.recent,&lines);
         set_text(l.notification,&app.note);
+        if let Some(view)=app.typing_views.as_ref() {
+            set_text(view.stats,&app.typing.stats());
+            set_text(view.last_gap,&format!(
+                "Last text gap: {}   |   largest gap (includes thinking/pauses): {:.1} ms   |   last raw gap: {}",
+                app.typing.latest_char_gap_ms.map_or_else(||"—".into(),|ms|format!("{ms:.3} ms")),
+                app.typing.largest_char_gap_ms,
+                app.typing.last_raw_gap_ms.map_or_else(||"—".into(),|ms|format!("{ms:.3} ms"))
+            ));
+            set_text(view.text_log,&app.typing.recent("WM_CHAR",11));
+            set_text(view.raw_log,&app.typing.recent("RAW_INPUT",11));
+        }
         if let Some(k)=app.key_views.as_ref(){
             let kd=&app.keyboard;
             set_text(k.counters,&format!(
@@ -433,6 +491,7 @@ fn toggle(){
             app.session.break_pair();
             app.keyboard.suspend();
             app.os_keys.clear_pending();
+            app.typing.suspend();
             app.active=!app.active;
             app.note=if app.active{
                 "Recording: press LEFT CLICK + SPACE, releasing both before repeating.".into()
@@ -450,6 +509,15 @@ fn reset(){
                     app.note="Keyboard diagnostics and Windows state checks cleared.".into();},
                 3=>{app.reaction.reset();
                     app.note="Reaction results cleared.".into();},
+                4=>{
+                    app.typing=TypingMonitor::new(app.frequency,now());
+                    app.keyboard=KeyboardDiagnostics::new(app.frequency);
+                    app.os_keys=OsKeyStateMonitor::new(now(),app.frequency);
+                    if let Some(view)=app.typing_views.as_ref() {
+                        set_text(view.input,"");
+                    }
+                    app.note="Typing text and timing history cleared.".into();
+                },
                 _=>{app.session.reset(now());app.note="Input comparison reset.".into();}
             }
         }
@@ -473,6 +541,7 @@ fn save(hwnd:H){
     let (suggested_file, title_text)=match mode {
         2=>("keyboard_diagnostics.csv","Export complete keyboard diagnostic history"),
         3=>("reaction_times.csv","Export mouse reaction-time trials"),
+        4=>("typing_event_timeline.csv","Export focused typing events and timings"),
         _=>("mouse_keyboard_results.csv","Export mouse / keyboard comparison"),
     };
     let mut path=[0u16;1024];
@@ -499,6 +568,7 @@ fn save(hwnd:H){
             match mode {
                 2=>app.keyboard.save_csv(Path::new(&filename),snapshot_ticks),
                 3=>app.reaction.save_csv(Path::new(&filename)),
+                4=>app.typing.save_csv(Path::new(&filename)),
                 _=>app.session.save_csv(Path::new(&filename)),
             }
         });
@@ -516,6 +586,8 @@ fn save(hwnd:H){
             // A key released while the modal dialog had focus must not
             // appear stuck after returning to the diagnostics screen.
             app.keyboard.suspend();
+            app.os_keys.clear_pending();
+            app.typing.suspend();
             app.session.break_pair();
             app.active=was_active;
         }
@@ -539,10 +611,15 @@ fn save_report(hwnd:H) {
     let (was_active, contents)=STATE.with(|cell|{
         let mut state=cell.borrow_mut();
         let Some(app)=state.as_mut() else {return (false,String::new());};
-        if app.mode!=2{return (false,String::new());}
+        if app.mode!=2 && app.mode!=4{return (false,String::new());}
         let previous=app.active;
         app.active=false;
-        let snapshot=app.keyboard.build_report(now(),&app.os_keys,&system_description());
+        let mut snapshot=app.keyboard.build_report(now(),&app.os_keys,&system_description());
+        if app.typing.chars>0 || app.mode==4 {
+            let contents=app.typing_views.as_ref()
+                .map_or_else(String::new,|view|get_text(view.input));
+            app.typing.append_report(&mut snapshot,&contents);
+        }
         (previous,snapshot)
     });
     if contents.is_empty(){return;}
@@ -580,6 +657,7 @@ fn save_report(hwnd:H) {
         if let Some(app)=cell.borrow_mut().as_mut(){
             app.keyboard.suspend();
             app.os_keys.clear_pending();
+            app.typing.suspend();
             app.session.break_pair();
             app.active=was_active;
         }
@@ -598,12 +676,14 @@ unsafe fn make_gui(hwnd:H){
     text(hwnd,instance,"INPUT TIMING LAB",30,16,860,45,f_title);
     text(hwnd,instance,"Three tests in one app  •  Win32 Raw Input  •  Live results without exporting files",
         32,62,860,24,f_small);
-    control(hwnd,instance,"BUTTON","1. Input Comparison",ID_MODE_COMPARE,
-        32,102,270,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    control(hwnd,instance,"BUTTON","2. Keyboard Diagnostics",ID_MODE_KEYBOARD,
-        319,102,281,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    control(hwnd,instance,"BUTTON","3. Mouse Reaction Time",ID_MODE_REACTION,
-        616,102,288,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","1. Comparison",ID_MODE_COMPARE,
+        32,102,205,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","2. Keyboard",ID_MODE_KEYBOARD,
+        250,102,205,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","3. Reaction",ID_MODE_REACTION,
+        468,102,205,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","4. Typing Test",ID_MODE_TYPING,
+        686,102,218,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     let start=control(hwnd,instance,"BUTTON","Pause",ID_START,
         31,163,155,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     control(hwnd,instance,"BUTTON","Reset mode",ID_RESET,
@@ -676,6 +756,30 @@ unsafe fn make_gui(hwnd:H){
     text(hwnd,instance,"The timer starts after the green frame's paint submission; monitor scan-out time is not measured.",
         32,891,875,23,f_small);
 
+    CREATE_GROUP.with(|g|g.set(4));
+    text(hwnd,instance,"LIVE TYPING / CHARACTER BURST TEST",32,230,870,35,f_title);
+    text(hwnd,instance,"Type into THIS box. It displays actual Windows text input (not a guessed Raw Input mapping).",
+        32,276,622,26,f_small);
+    control(hwnd,instance,"BUTTON","Save Diagnostic Report",ID_DIAGNOSTIC_REPORT,
+        670,269,232,41,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    text(hwnd,instance,"WINDOWS TEXTBOX — type a test sentence repeatedly, including rapid typing",
+        32,315,870,26,f_medium);
+    let typing_input=control(hwnd,instance,"EDIT","",ID_TYPING_INPUT,
+        32,349,870,157,WS_TABSTOP|WS_BORDER|WS_VSCROLL|ES_MULTILINE|
+            ES_AUTOVSCROLL|ES_WANTRETURN,f_medium);
+    // Subclass only this test field. No system-wide keyboard hook or injection.
+    let old_proc=SetWindowLongPtrW(typing_input,GWLP_WNDPROC,typing_edit_proc as usize as isize);
+    if old_proc!=0 {ORIGINAL_TYPING_PROC.with(|cell|cell.set(old_proc));}
+    text(hwnd,instance,"LIVE CHARACTER DELIVERY / INPUT COUNTS",32,519,870,26,f_medium);
+    let typing_stats=text(hwnd,instance,"",32,550,870,27,f_small);
+    let typing_gap=text(hwnd,instance,"",32,579,870,27,f_small);
+    text(hwnd,instance,"ACTUAL WINDOWS WM_CHAR ARRIVAL TIMELINE (latest below)",32,621,870,27,f_medium);
+    let typed_chars=control(hwnd,instance,"EDIT","",0,
+        32,653,870,115,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
+    text(hwnd,instance,"RAW INPUT ARRIVALS — compare key-down / key-up / repeat timing",32,782,870,26,f_medium);
+    let typed_raw=control(hwnd,instance,"EDIT","",0,
+        32,813,870,105,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
+
     CREATE_GROUP.with(|g|g.set(0));
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
@@ -689,6 +793,10 @@ unsafe fn make_gui(hwnd:H){
             app.reaction_views=Some(ReactionViews{
                 action:arm_button,
                 status,stats:rx_stats,last,recent:rx_recent,
+            });
+            app.typing_views=Some(TypingViews{
+                input:typing_input,stats:typing_stats,last_gap:typing_gap,
+                text_log:typed_chars,raw_log:typed_raw,
             });
         }
     });
@@ -741,13 +849,19 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                             let down=key.flags&RI_KEY_BREAK==0;
                             if app.mode==1 && key.key==VK_SPACE {
                                 app.session.space_key(down,tick);
-                            } else if app.mode==2 {
+                            } else if app.mode==2 || app.mode==4 {
                                 let scan=if key.make==0{key.key}else{key.make};
                                 let id=KeyId::new(scan,key.flags);
                                 let delay=(GetTickCount64() as u32).wrapping_sub(GetMessageTime() as u32);
                                 app.keyboard.observe_queue_age(delay);
-                                app.keyboard.event_vk(
-                                    id,key_name(key.key,scan,key.flags),down,tick,key.key);
+                                let label=key_name(key.key,scan,key.flags);
+                                if app.mode==4 {
+                                    let repeat=down && app.keyboard.observed_vk_states()
+                                        .iter().any(|(vk,_,held)|*vk==key.key && *held);
+                                    app.typing.raw(&label,
+                                        if !down{"UP"}else if repeat{"REPEAT"}else{"DOWN"},tick);
+                                }
+                                app.keyboard.event_vk(id,label,down,tick,key.key);
                             }
                         }
                         _=>{}
@@ -758,7 +872,13 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
             return DefWindowProcW(hwnd,msg,wp,lp);
         }
         WM_COMMAND=>{
-            match wp&0xFFFF {
+            let id=wp&0xFFFF;
+            if id==ID_TYPING_INPUT {
+                // EN_CHANGE and other notifications must NOT steal textbox
+                // focus. The user must be able to type continuously.
+                return 0;
+            }
+            match id {
                 ID_START=>toggle(),
                 ID_RESET=>reset(),
                 ID_SAVE=>save(hwnd),
@@ -766,17 +886,23 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                 ID_MODE_COMPARE=>select_mode(hwnd,1),
                 ID_MODE_KEYBOARD=>select_mode(hwnd,2),
                 ID_MODE_REACTION=>select_mode(hwnd,3),
+                ID_MODE_TYPING=>select_mode(hwnd,4),
                 ID_REACTION_ARM=>arm_reaction(hwnd),
                 _=>{},
             }
-            // Avoid Space keypresses triggering focused buttons in diagnostic mode.
-            SetFocus(hwnd);
+            // Keep the test textbox focused after toolbar commands. Other
+            // modes focus the parent so Space won't activate a button.
+            let field=STATE.with(|cell|{
+                cell.borrow().as_ref().and_then(|app|
+                    (app.mode==4).then(||app.typing_views.as_ref().map(|v|v.input)).flatten())
+            });
+            if let Some(field)=field {SetFocus(field);} else {SetFocus(hwnd);}
             return 0;
         }
         WM_KEYDOWN if wp as u16==VK_F5=>{
             // F5 acts as pause/resume except in the keyboard key-troubleshooting mode.
             let mode=STATE.with(|cell|cell.borrow().as_ref().map_or(1,|s|s.mode));
-            if mode!=2 {toggle();}
+            if mode!=2 && mode!=4 {toggle();}
             return 0;
         }
         WM_PAINT=>{paint_reaction(hwnd);return 0;}
@@ -785,7 +911,7 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                 let mut state=cell.borrow_mut();
                 let Some(app)=state.as_mut()else{return false};
                 if !app.active{return false;}
-                if app.mode==2 {
+                if app.mode==2 || app.mode==4 {
                     let when=now();
                     let observed=app.keyboard.observed_vk_states();
                     for (vk,label,raw_down) in observed {
@@ -820,11 +946,12 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
     STATE.with(|cell|{
         *cell.borrow_mut()=Some(State{
             session:Session::new(now(),frequency),active:true,labels:None,
-            note:"Live capture active. Select any of the three modes above.".into(),
+            note:"Live capture active. Select one of four modes above.".into(),
             mode:1,groups:std::array::from_fn(|_|Vec::new()),frequency,
             keyboard:KeyboardDiagnostics::new(frequency),
             os_keys:OsKeyStateMonitor::new(now(),frequency),key_views:None,
             reaction:ReactionTest::default(),reaction_views:None,
+            typing:TypingMonitor::new(frequency,now()),typing_views:None,
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");
