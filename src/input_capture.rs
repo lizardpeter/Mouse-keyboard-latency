@@ -4,7 +4,7 @@
 //! it never touches GUI controls, files, registry, timers' resolution or drivers.
 use crate::watchdog::Heartbeat;
 use std::{cell::RefCell,ffi::c_void,io,mem::{size_of,zeroed},
-    ptr::{null,null_mut},sync::{Arc,atomic::{AtomicBool,AtomicU64,Ordering},
+    ptr::{null,null_mut},sync::{Arc,atomic::{AtomicBool,AtomicU64,AtomicUsize,Ordering},
     mpsc::{self,Receiver,SyncSender,TrySendError}},thread::{self,JoinHandle}};
 
 type H=*mut c_void;
@@ -104,6 +104,7 @@ struct Context {
     enabled:Arc<AtomicBool>,
     generation:Arc<AtomicU64>,
     dropped:Arc<AtomicU64>,
+    mode:Arc<AtomicUsize>,
     heartbeat:Heartbeat,
     freq:i64,
     // Data needed only on the input thread, not referenced from the GUI.
@@ -129,7 +130,12 @@ unsafe extern "system" fn input_proc(hwnd:H,msg:u32,wp:usize,lp:isize)->isize{
                     0 if got as usize>=size_of::<RawHeader>()+size_of::<RawMouse>()=>{
                         let m=raw.data.mouse;
                         let mut p=[0,0];
-                        let _=GetCursorPos(&mut p);
+                        // Avoid an expensive cursor API query on every 8kHz
+                        // mouse report in keyboard/reaction/comparison modes.
+                        let mode=ctx.mode.load(Ordering::Relaxed);
+                        if mode==5 || m.buttons as u16!=0{
+                            let _=GetCursorPos(&mut p);
+                        }
                         Kind::Mouse{flags:m.flags,buttons:m.buttons as u16,
                             dx:m.last_x,dy:m.last_y,cursor_x:p[0],cursor_y:p[1]}
                     },
@@ -173,6 +179,7 @@ pub struct InputCapture{
     enabled:Arc<AtomicBool>,
     generation:Arc<AtomicU64>,
     dropped:Arc<AtomicU64>,
+    mode:Arc<AtomicUsize>,
 }
 impl InputCapture{
     pub fn start(freq:i64,beat:Heartbeat)->io::Result<Self>{
@@ -181,7 +188,8 @@ impl InputCapture{
         let enabled=Arc::new(AtomicBool::new(false));
         let generation=Arc::new(AtomicU64::new(1));
         let dropped=Arc::new(AtomicU64::new(0));
-        let e=enabled.clone();let g=generation.clone();let d=dropped.clone();
+        let mode=Arc::new(AtomicUsize::new(1));
+        let e=enabled.clone();let g=generation.clone();let d=dropped.clone();let m=mode.clone();
         let worker=thread::Builder::new()
             .name("input-timing-raw-capture".into()).spawn(move ||{
                 // This thread owns the only Raw Input registration for the GUI process.
@@ -197,7 +205,7 @@ impl InputCapture{
                         return;
                     }
                     CONTEXT.with(|slot|*slot.borrow_mut()=Some(Context{
-                        tx,enabled:e,generation:g,dropped:d,heartbeat:beat,freq
+                        tx,enabled:e,generation:g,dropped:d,mode:m,heartbeat:beat,freq
                     }));
                     let hwnd=CreateWindowExW(0,cls.as_ptr(),cls.as_ptr(),0,
                         0,0,0,0,HWND_MESSAGE,null_mut(),instance,null());
@@ -240,8 +248,9 @@ impl InputCapture{
                 return Err(io::Error::other("Raw Input thread exited before starting"));
             }
         };
-        Ok(Self{rx,hwnd,worker:Some(worker),enabled,generation,dropped})
+        Ok(Self{rx,hwnd,worker:Some(worker),enabled,generation,dropped,mode})
     }
+    pub fn set_mode(&self,mode:usize){self.mode.store(mode,Ordering::Release);}
     pub fn set_enabled(&self,enabled:bool){
         self.generation.fetch_add(1,Ordering::SeqCst);
         self.enabled.store(enabled,Ordering::SeqCst);
