@@ -10,6 +10,8 @@ const POST_MS: f64=5_000.0;
 const ROLL_CAP:usize=100_000;
 const CAPTURE_CAP:usize=125_000;
 const ANOMALY_CAP:usize=128;
+const ARCHIVE_CAP:usize=5;
+const CAPTURE_COOLDOWN_MS:f64=8000.0;
 pub const LANES:usize=6;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -36,7 +38,7 @@ impl FlightEvent {
     }
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum Reason{RepeatBurst,CharacterBurst,QueueAge,GuiGap,InputGap,Manual}
+pub enum Reason{RepeatBurst,CharacterBurst,QueueAge,GuiGap,InputGap,SlowRepeat,ClickMarker,Manual}
 impl Reason{
     pub fn label(self)->&'static str {
         match self{
@@ -45,6 +47,8 @@ impl Reason{
             Self::QueueAge=>"Coarse message-queue age",
             Self::GuiGap=>"GUI heartbeat stall",
             Self::InputGap=>"Raw Input receiver heartbeat stall",
+            Self::SlowRepeat=>"Slow held-key repeat delivery",
+            Self::ClickMarker=>"Mouse click while Raw Input shows key held",
             Self::Manual=>"Manual capture"
         }
     }
@@ -52,11 +56,17 @@ impl Reason{
 #[derive(Clone,Copy,Debug)]
 pub struct Marker{pub tick:i64,pub reason:Reason,pub detail_ms:f64}
 
+struct ArchivedCapture {
+    trigger:Marker,events:Vec<FlightEvent>,complete:bool
+}
 pub struct FlightRecorder {
     frequency:i64,
     epoch:i64,
     rolling:VecDeque<FlightEvent>,
     frozen:Vec<FlightEvent>,
+    archives:VecDeque<ArchivedCapture>,
+    trigger:Option<Marker>,
+    last_completed_at:Option<i64>,
     pub markers:Vec<Marker>,
     pub dropped:u64,
     pub recording:bool,
@@ -74,7 +84,8 @@ impl FlightRecorder {
     pub fn new(frequency:i64,epoch:i64)->Self{
         assert!(frequency>0);
         Self{frequency,epoch,rolling:VecDeque::with_capacity(ROLL_CAP),
-            frozen:Vec::with_capacity(CAPTURE_CAP),markers:Vec::new(),
+            frozen:Vec::with_capacity(CAPTURE_CAP),archives:VecDeque::new(),
+            trigger:None,last_completed_at:None,markers:Vec::new(),
             dropped:0,recording:false,completed:false,deadline:0,
             last_fast_repeat:None,last_fast_char:None,last_signal_tick:None,
             width_ms:15_000.0,pan_ms:0.0,anomalies:0,watchdog_gaps:0}
@@ -91,36 +102,55 @@ impl FlightRecorder {
             && reason!=Reason::Manual{return;}
         self.last_signal_tick=Some(tick);
         self.anomalies+=1;
-        if self.markers.len()<ANOMALY_CAP{
-            self.markers.push(Marker{tick,reason,detail_ms});
-        }
-        if !self.recording && !self.completed{
-            self.start(tick);
+        if self.markers.len()==ANOMALY_CAP{self.markers.remove(0);}
+        let marker=Marker{tick,reason,detail_ms};
+        self.markers.push(marker);
+        if self.recording{
+            // Explicit manual click extends an existing capture's postroll.
+            if reason==Reason::Manual{
+                self.deadline=self.deadline.max(tick.saturating_add(self.ticks(POST_MS)));
+            }
+        }else{
+            let cooled=self.last_completed_at.is_none_or(|end|
+                tick.saturating_sub(end)>=self.ticks(CAPTURE_COOLDOWN_MS));
+            if cooled || reason==Reason::Manual {
+                self.start(tick,marker);
+            }
         }
     }
-    fn start(&mut self,tick:i64){
+    fn start(&mut self,tick:i64,trigger:Marker){
+        if self.completed{
+            if let Some(previous)=self.trigger.take(){
+                if self.archives.len()==ARCHIVE_CAP{self.archives.pop_front();}
+                self.archives.push_back(ArchivedCapture{
+                    trigger:previous,
+                    events:std::mem::take(&mut self.frozen),complete:true
+                });
+            }
+        }
         let min=tick.saturating_sub(self.ticks(PRE_MS));
         self.frozen.clear();
         self.frozen.extend(self.rolling.iter().filter(|e|e.tick>=min)
             .take(CAPTURE_CAP).copied());
-        self.recording=true;
+        self.recording=true;self.completed=false;self.trigger=Some(trigger);
         self.deadline=tick.saturating_add(self.ticks(POST_MS));
         self.width_ms=PRE_MS+POST_MS;self.pan_ms=0.0;
     }
     pub fn manual_capture(&mut self,tick:i64){
-        if !self.recording && !self.completed{
-            self.signal(tick,Reason::Manual,0.0);
-        }
+        self.signal(tick,Reason::Manual,0.0);
     }
     pub fn finish(&mut self,now:i64){
         if self.recording && now>=self.deadline{
-            self.recording=false;self.completed=true;
+            self.recording=false;self.completed=true;self.last_completed_at=Some(self.deadline);
         }
     }
     /// When switching from a capture mode to the viewer before post-roll ends,
     /// finish early rather than presenting a perpetually "recording" snapshot.
     pub fn finish_early(&mut self){
-        if self.recording{self.recording=false;self.completed=true;}
+        if self.recording{
+            self.recording=false;self.completed=true;
+            self.last_completed_at=self.frozen.last().map(|e|e.tick).or(Some(self.deadline));
+        }
         self.clear_temporal_state();
     }
     pub fn observe(&mut self,event:FlightEvent){
@@ -215,10 +245,11 @@ impl FlightRecorder {
         histogram
     }
     pub fn summary(&self)->String{
-        let state=if self.recording{"Collecting 5s post-trigger"}
-            else if self.completed{"FROZEN — ready to export"}
-            else{"Armed — 10s rolling memory only"};
-        format!("{state} | anomalies {} | heartbeat stalls {} | samples {} | dropped {}",
+        let state=if self.recording{"Capturing incident (+5s postroll)"}
+            else if self.completed{"Last incident frozen (auto-rearms after cooldown)"}
+            else{"Armed — live 10s ring buffer"};
+        format!("{state} | captured incidents {} | anomaly markers {} | stalls {} | events {} | overflow {}",
+            self.archives.len()+usize::from(self.trigger.is_some()),
             self.anomalies,self.watchdog_gaps,
             if self.recording||self.completed{self.frozen.len()}else{self.rolling.len()},
             self.dropped)
@@ -234,18 +265,29 @@ impl FlightRecorder {
         let _=writeln!(out,"\nINPUT TIMING LAB — IN-MEMORY FLIGHT RECORDER");
         let _=writeln!(out,"Keyboard key names/codes can reveal test inputs. Review before sharing.");
         let _=writeln!(out,"Capture uses user-mode process observations, not physical switch/USB latency.");
-        let _=writeln!(out,"10-second preroll; 5-second postroll if diagnostics stays active.");
+        let _=writeln!(out,"Each incident has 10-second preroll and 5-second postroll (if recording stays active).");
+        let _=writeln!(out,"Latest incident plus 5 previous incident snapshots retained. Auto capture rearms 8s after last completion.");
+        let _=writeln!(out,"A separate rolling 10-second view is always retained; archives have a bounded event cap.");
         let _=writeln!(out,"{}",self.summary());
         let _=writeln!(out,"Markers:");
         for m in &self.markers {
             let _=writeln!(out,"{:.3} ms | {} | {:.3}",self.ms(m.tick),m.reason.label(),m.detail_ms);
         }
-        let _=writeln!(out,"time_ms | channel | action | vk | device_handle | value | approximate_queue_age_ms");
-        if self.recording||self.completed{
-            for e in &self.frozen{self.write_event(out,e);}
-        }else{
-            for e in &self.rolling{self.write_event(out,e);}
+        for (i,archive) in self.archives.iter().enumerate(){
+            let _=writeln!(out,"\nARCHIVED INCIDENT {}: {:.3}ms {} (completed {})",
+                i+1,self.ms(archive.trigger.tick),archive.trigger.reason.label(),archive.complete);
+            let _=writeln!(out,"time_ms | channel | action | vk | device_handle | value | approximate_queue_age_ms");
+            for e in &archive.events{self.write_event(out,e);}
         }
+        if let Some(trigger)=self.trigger{
+            let _=writeln!(out,"\nLATEST INCIDENT: {:.3}ms {} (complete {}, currently collecting {})",
+                self.ms(trigger.tick),trigger.reason.label(),self.completed,self.recording);
+            let _=writeln!(out,"time_ms | channel | action | vk | device_handle | value | approximate_queue_age_ms");
+            for e in &self.frozen{self.write_event(out,e);}
+        }
+        let _=writeln!(out,"\nLATEST 10-SECOND ROLLING EVENTS (overlap with incident windows is expected)");
+        let _=writeln!(out,"time_ms | channel | action | vk | device_handle | value | approximate_queue_age_ms");
+        for e in &self.rolling{self.write_event(out,e);}
     }
     fn write_event(&self,out:&mut String,e:&FlightEvent){
         let _=writeln!(out,"{:.3} | {} | {} | {} | 0x{:x} | {} | {}",
@@ -253,14 +295,17 @@ impl FlightRecorder {
     }
     pub fn save_csv(&self,path:&Path)->io::Result<()>{
         let mut out=io::BufWriter::new(std::fs::File::create(path)?);
-        writeln!(out,"time_ms,channel,action,vk,device_handle,value,approx_queue_age_ms")?;
-        let dump=|e:&FlightEvent,out:&mut io::BufWriter<std::fs::File>|{
-            writeln!(out,"{:.3},{},{},{},0x{:x},{},{}",
+        writeln!(out,"segment,time_ms,channel,action,vk,device_handle,value,approx_queue_age_ms")?;
+        let dump=|segment:&str,e:&FlightEvent,out:&mut io::BufWriter<std::fs::File>|{
+            writeln!(out,"{segment},{:.3},{},{},{},0x{:x},{},{}",
                 self.ms(e.tick),e.lane.label(),e.tag,e.vk,e.device,e.value,e.queue_ms)
         };
-        if self.recording||self.completed{
-            for e in &self.frozen{dump(e,&mut out)?;}
-        }else{for e in &self.rolling{dump(e,&mut out)?;}}
+        for (i,archive) in self.archives.iter().enumerate(){
+            let label=format!("incident_{}",i+1);
+            for e in &archive.events{dump(&label,e,&mut out)?;}
+        }
+        for e in &self.frozen{dump("latest_incident",e,&mut out)?;}
+        for e in &self.rolling{dump("rolling_10s",e,&mut out)?;}
         out.flush()
     }
 }
@@ -300,6 +345,22 @@ mod tests{
         r.finish_early();assert!(r.completed);
         let h=r.histogram(10_000,100);
         assert!(h.iter().any(|b|b[Lane::Char as usize]>0));
+    }
+    #[test]fn repeated_incidents_are_kept_and_last_episode_is_not_only_one(){
+        let mut r=FlightRecorder::new(1_000_000,0);
+        r.observe(raw(0,"DOWN"));
+        r.manual_capture(100_000);
+        r.finish(6_000_000);
+        assert!(r.completed);
+        r.observe(raw(20_000_000,"UP"));
+        r.manual_capture(20_000_010);
+        assert_eq!(r.archives.len(),1);
+        assert_eq!(r.archives[0].trigger.reason,Reason::Manual);
+        assert!(r.recording);
+        let mut report=String::new();
+        r.append_report(&mut report);
+        assert!(report.contains("ARCHIVED INCIDENT 1"));
+        assert!(report.contains("LATEST INCIDENT"));
     }
     #[test]fn no_markers_without_anomaly_and_queue_age_debounced(){
         let mut r=FlightRecorder::new(1_000_000,0);
