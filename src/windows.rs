@@ -1204,6 +1204,14 @@ fn consume_captured(hwnd:H,app:&mut State,e:CapturedInput)->bool{
         CapturedKind::Mouse{flags,buttons,dx,dy,cursor_x,cursor_y}=>{
             let mut p=Point{x:cursor_x,y:cursor_y};
             unsafe{ScreenToClient(hwnd,&mut p);}
+            if matches!(app.mode,2|4){
+                let incident=app.live_probe.mouse(tick,e.device,dx,dy,
+                    buttons&RI_MOUSE_LEFT_BUTTON_DOWN!=0,
+                    age,elapsed,e.cpu.group,e.cpu.number);
+                if incident==Some(IncidentKind::ClickWhileHeld){
+                    app.flight.external_incident(tick,Reason::ClickMarker,0.0);
+                }
+            }
             if app.mode==5{
                 app.polling.mouse(e.device,tick,dx,dy,buttons);
                 app.mouse_diag.observe(tick,e.device,dx,dy,
@@ -1244,6 +1252,12 @@ fn consume_captured(hwnd:H,app:&mut State,e:CapturedInput)->bool{
             if app.mode==1 && vk==VK_SPACE {
                 app.session.space_key(down,tick);
             }else if matches!(app.mode,2|4){
+                let incident=app.live_probe.key(tick,e.device,vk,scan,flags,
+                    age,elapsed,e.cpu.group,e.cpu.number);
+                if incident==Some(IncidentKind::SlowRepeat){
+                    app.flight.external_incident(tick,Reason::SlowRepeat,
+                        app.live_probe.worst_repeat_ms);
+                }
                 let sc=if scan==0{vk}else{scan};
                 let id=KeyId::new(sc,flags);
                 let repeat=down && app.keyboard.observed_vk_states()
@@ -1367,6 +1381,14 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                         app.flight.observe(FlightEvent::new(gap.ended,
                             Lane::Watchdog,"CAPTURE_STALL",0,0,
                             gap.duration_ms.round() as i32,0));
+                    }
+                }
+                for late in app.scheduler_probe.drain(){
+                    if matches!(app.mode,2|4|5){
+                        app.thread_metrics.scheduler_wake_gap(late.elapsed_ms);
+                        app.flight.observe(FlightEvent::new(late.tick,
+                            Lane::Watchdog,"SCHEDULER_WAKE_GAP",0,0,
+                            late.elapsed_ms.round() as i32,0));
                     }
                 }
                 if app.mode==2 || app.mode==4 {
