@@ -10,6 +10,7 @@ pub struct TraceEvent {
     pub repeats: u16, pub prev_down: bool, pub transition: bool,
     pub msg_age_ms: u32, pub queue_bits: u32, pub device: usize,
     pub dx: i32, pub dy: i32, pub cursor_x: i32, pub cursor_y: i32,
+    pub buttons: u16,
 }
 impl TraceEvent {
     pub fn keyboard_msg(qpc:i64, kind:&'static str, vk:usize, lp:isize,
@@ -20,14 +21,14 @@ impl TraceEvent {
             repeats:(bits&0xffff) as u16,
             prev_down:(bits&(1<<30))!=0,transition:(bits&(1<<31))!=0,
             msg_age_ms:age,queue_bits:queued,device:0,dx:0,dy:0,
-            cursor_x:0,cursor_y:0,
+            cursor_x:0,cursor_y:0,buttons:0,
         }
     }
     pub fn raw(qpc:i64, kind:&'static str, vk:u16, scan:u16,
                age:u32, queued:u32,device:usize,dx:i32,dy:i32,
-               cursor_x:i32,cursor_y:i32)->Self {
+               cursor_x:i32,cursor_y:i32,buttons:u16)->Self {
         Self {qpc,kind,vk,scan,repeats:0,prev_down:false,transition:false,
-            msg_age_ms:age,queue_bits:queued,device,dx,dy,cursor_x,cursor_y}
+            msg_age_ms:age,queue_bits:queued,device,dx,dy,cursor_x,cursor_y,buttons}
     }
 }
 pub struct DeepTrace {
@@ -86,12 +87,12 @@ impl DeepTrace {
         let _=writeln!(out,"Long dispatch gaps include intentional inactivity and are not automatically stalls.");
         let _=writeln!(out,"{}",self.summary());
         let _=writeln!(out,"Events: {} (dropped after cap: {})",self.events.len(),self.dropped);
-        let _=writeln!(out,"time_ms | type | vk | scan | key_repeat_count | prev_down | transition | queue_age_ms | queue_bits | device_handle | raw_dx | raw_dy | cursor_x | cursor_y");
+        let _=writeln!(out,"time_ms | type | vk | scan | key_repeat_count | prev_down | transition | queue_age_ms | queue_bits | device_handle | raw_dx | raw_dy | cursor_x | cursor_y | mouse_buttons");
         for e in &self.events {
-            let _=writeln!(out,"{:.3} | {} | {} | {} | {} | {} | {} | {} | 0x{:04x} | 0x{:x} | {} | {} | {} | {}",
+            let _=writeln!(out,"{:.3} | {} | {} | {} | {} | {} | {} | {} | 0x{:04x} | 0x{:x} | {} | {} | {} | {} | 0x{:04x}",
                 self.to_ms(e.qpc),e.kind,e.vk,e.scan,e.repeats,e.prev_down,
                 e.transition,e.msg_age_ms,e.queue_bits,e.device,
-                e.dx,e.dy,e.cursor_x,e.cursor_y);
+                e.dx,e.dy,e.cursor_x,e.cursor_y,e.buttons);
         }
     }
 }
