@@ -36,7 +36,7 @@ impl FlightEvent {
     }
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum Reason{RepeatBurst,CharacterBurst,QueueAge,GuiGap,Manual}
+pub enum Reason{RepeatBurst,CharacterBurst,QueueAge,GuiGap,InputGap,Manual}
 impl Reason{
     pub fn label(self)->&'static str {
         match self{
@@ -44,6 +44,7 @@ impl Reason{
             Self::CharacterBurst=>"WM_CHAR burst",
             Self::QueueAge=>"Coarse message-queue age",
             Self::GuiGap=>"GUI heartbeat stall",
+            Self::InputGap=>"Raw Input receiver heartbeat stall",
             Self::Manual=>"Manual capture"
         }
     }
@@ -161,7 +162,8 @@ impl FlightRecorder {
             Lane::Watchdog=>{
                 if event.value>=200{
                     self.watchdog_gaps+=1;
-                    self.signal(event.tick,Reason::GuiGap,event.value as f64);
+                    let reason=if event.tag=="CAPTURE_STALL"{Reason::InputGap}else{Reason::GuiGap};
+                    self.signal(event.tick,reason,event.value as f64);
                 }
             },
             _=>{},
