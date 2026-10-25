@@ -944,7 +944,7 @@ unsafe fn make_gui(hwnd:H){
     control(hwnd,instance,"BUTTON","Save Diagnostic Report",ID_DIAGNOSTIC_REPORT,
         672,275,232,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     text(hwnd,instance,"LIVE RAW MOUSE STATISTICS",32,333,870,28,f_medium);
-    let mouse_stats=text(hwnd,instance,"",32,375,860,106,f_medium);
+    let mouse_stats=text(hwnd,instance,"",32,370,860,134,f_medium);
     text(hwnd,instance,"LATEST RAW DELTAS vs SAMPLED WINDOWS CURSOR COORDINATES",
         32,505,870,28,f_medium);
     let mouse_recent=control(hwnd,instance,"EDIT","",0,
