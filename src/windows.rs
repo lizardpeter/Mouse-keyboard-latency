@@ -410,6 +410,36 @@ fn select_mode(hwnd:H,new_mode:usize){
     }
     refresh();
 }
+fn query_hid() {
+    // An explicit button press initiates only GET operations on device metadata.
+    // Handles are opened with ZERO requested access; unsupported is not an error.
+    let devices=STATE.with(|cell|{
+        let c=cell.borrow();
+        c.as_ref().map_or_else(Vec::new,|app|{
+            let mut handles=Vec::new();
+            for &h in app.polling.mice.keys(){handles.push((true,h));}
+            for &h in app.polling.keyboards.keys(){handles.push((false,h));}
+            handles
+        })
+    });
+    let count=devices.len();
+    let mut succeeded=0;
+    let mut results=Vec::with_capacity(count);
+    for (mouse,handle) in devices {
+        let ms=get_hid_polled_interval_ms(handle);
+        if ms.is_some(){succeeded+=1;}
+        results.push((mouse,handle,ms));
+    }
+    STATE.with(|cell|{
+        if let Some(app)=cell.borrow_mut().as_mut(){
+            for (mouse,handle,ms) in results{
+                app.polling.set_hid_query(mouse,handle,ms);
+            }
+            app.note=format!("Read-only HID query: {succeeded}/{count} collections supplied an interval. This is NOT USB endpoint bInterval; unsupported means unknown.");
+        }
+    });
+    refresh();
+}
 fn arm_reaction(hwnd:H){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
@@ -844,8 +874,10 @@ unsafe fn make_gui(hwnd:H){
 
     CREATE_GROUP.with(|g|g.set(2));
     text(hwnd,instance,"KEYBOARD EVENT DIAGNOSTICS",32,230,870,34,f_title);
-    text(hwnd,instance,"Reproduce the issue, then save the full report to share.",
-        33,276,625,24,f_small);
+    control(hwnd,instance,"BUTTON","Read HID interval (GET)",ID_QUERY_HID,
+        32,273,212,37,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    text(hwnd,instance,"Reproduce the issue; Save Report for full timing.",
+        252,277,410,24,f_small);
     control(hwnd,instance,"BUTTON","Save Diagnostic Report",ID_DIAGNOSTIC_REPORT,
         670,269,232,41,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     text(hwnd,instance,"RAW KEY-DOWN / KEY-UP COUNTS",32,314,870,25,f_medium);
@@ -853,12 +885,13 @@ unsafe fn make_gui(hwnd:H){
     text(hwnd,instance,"KEYS RAW INPUT STILL REPORTS AS HELD",32,397,870,25,f_medium);
     let held=text(hwnd,instance,"",32,430,870,76,f_medium);
     text(hwnd,instance,"SUSPECTED EVENT ANOMALIES",32,527,870,28,f_medium);
-    let alerts=text(hwnd,instance,"",32,562,870,48,f_small);
-    let durations=text(hwnd,instance,"",32,614,870,33,f_small);
-    let queue=text(hwnd,instance,"",32,651,870,26,f_small);
-    let os_state=text(hwnd,instance,"",32,680,870,27,f_small);
-    text(hwnd,instance,"RECENT RAW KEY EVENTS",32,710,870,26,f_medium);
-    let key_recent=text(hwnd,instance,"",32,739,870,140,f_small);
+    let alerts=text(hwnd,instance,"",32,562,870,40,f_small);
+    let durations=text(hwnd,instance,"",32,606,870,31,f_small);
+    let queue=text(hwnd,instance,"",32,636,870,26,f_small);
+    let os_state=text(hwnd,instance,"",32,665,870,25,f_small);
+    let key_poll=text(hwnd,instance,"",32,692,870,85,f_small);
+    text(hwnd,instance,"RECENT RAW KEY EVENTS",32,779,870,25,f_medium);
+    let key_recent=text(hwnd,instance,"",32,808,870,79,f_small);
     text(hwnd,instance,"Only type test keys, never passwords. The saved report contains every key name observed.",
         32,891,870,24,f_small);
 
@@ -904,8 +937,10 @@ unsafe fn make_gui(hwnd:H){
 
     CREATE_GROUP.with(|g|g.set(5));
     text(hwnd,instance,"RAW MOUSE POLLING / WINDOWS CURSOR",32,230,870,35,f_title);
-    text(hwnd,instance,"Keep moving the mouse. Report spacing is not guaranteed device polling frequency.",
-        32,277,625,38,f_small);
+    control(hwnd,instance,"BUTTON","Read HID interval (GET)",ID_QUERY_HID,
+        32,276,212,37,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    text(hwnd,instance,"Move mouse continuously; Raw Input rate != hardware bus polls.",
+        255,276,414,38,f_small);
     control(hwnd,instance,"BUTTON","Save Diagnostic Report",ID_DIAGNOSTIC_REPORT,
         672,275,232,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     text(hwnd,instance,"LIVE RAW MOUSE STATISTICS",32,333,870,28,f_medium);
@@ -926,7 +961,7 @@ unsafe fn make_gui(hwnd:H){
                 key_count,key_last,key_age,key_interval,
                 count,mouse,keyboard,median,secondary,latest_pair,recent,notification,
             });
-            app.key_views=Some(KeyboardViews{counters,held,alerts,durations,queue,os_state,recent:key_recent});
+            app.key_views=Some(KeyboardViews{counters,held,alerts,durations,queue,os_state,recent:key_recent,polling:key_poll});
             app.reaction_views=Some(ReactionViews{
                 action:arm_button,
                 status,stats:rx_stats,last,recent:rx_recent,
@@ -967,6 +1002,8 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                         let mut p=Point::default();
                         if GetCursorPos(&mut p)!=0{ScreenToClient(hwnd,&mut p);}
                         if app.mode==5 {
+                            app.polling.mouse(raw.header.device as usize,tick,
+                                mouse.last_x,mouse.last_y,mouse.buttons as u16);
                             app.mouse_diag.observe(tick,raw.header.device as usize,
                                 mouse.last_x,mouse.last_y,mouse.flags&1!=0,
                                 mouse.buttons as u16,p.x,p.y);
@@ -981,6 +1018,10 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                         }
                     } else if raw.header.kind==1 && (app.mode==2 || app.mode==4 || app.mode==5) {
                         let k=raw.data.key;
+                        if app.mode==2||app.mode==4 {
+                            app.polling.keyboard(raw.header.device as usize,tick,
+                                k.key,k.make,k.flags&RI_KEY_BREAK==0);
+                        }
                         app.trace.record(TraceEvent::raw(tick,"RAW_KEY",k.key,k.make,
                             age,bits,raw.header.device as usize,0,0,0,0,0,first_pending_raw_size()));
                     }
@@ -1055,6 +1096,7 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                 ID_MODE_TYPING=>select_mode(hwnd,4),
                 ID_REACTION_ARM=>arm_reaction(hwnd),
                 ID_MODE_MOUSE=>select_mode(hwnd,5),
+                ID_QUERY_HID=>query_hid(),
                 ID_VULKAN_SCENE=>{
                     match std::env::current_exe().and_then(|exe|
                         std::process::Command::new(exe).arg("--vulkan-scene").spawn()) {
