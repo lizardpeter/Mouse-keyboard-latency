@@ -1,6 +1,6 @@
 # Mouse / Keyboard Input Timing Lab
 
-A native **Windows x64 GUI** built in Rust, with five interactive diagnostic modes and an optional native Vulkan scene. All results appear directly inside the application. CSV export is optional and **exports the currently selected mode**, including the complete keyboard event history.
+A native **Windows x64 GUI** built in Rust, with six interactive diagnostic modes and an optional native Vulkan scene. All results appear directly inside the application, including a zoomable in-memory anomaly timeline. CSV export is optional and **exports the currently selected mode**, including the complete keyboard event history.
 
 ## Download the executable (no Rust required)
 
@@ -10,6 +10,25 @@ A native **Windows x64 GUI** built in Rust, with five interactive diagnostic mod
 4. Extract the ZIP and double-click `Mouse-Keyboard-Latency.exe`.
 
 The Windows build runs automatically when code is pushed to `main`. It produces a normal desktop GUI `.exe`, not a console program. No driver installation, Rust installation, or Vulkan SDK is required. The optional Vulkan scene dynamically loads the Vulkan runtime provided by the installed graphics driver; if unavailable, the original Win32 diagnostics still run.
+
+## Mode 6: Flight Recorder — anomaly capture and timeline
+
+**The new flight recorder is strictly passive and in-memory.** It keeps the most recent **10 seconds** of input events while the application is recording in **Keyboard (2)**, **Typing (4)**, or **Mouse (5)**. It automatically marks and snapshots a time window when it sees one of:
+
+- **Raw repeat burst:** four repeat keydown events for the same key/device with three successive gaps under 5 ms. Normal 33 ms typematic repeats should not trigger this.
+- **Character burst:** at least three `WM_CHAR` events with two consecutive inter-character gaps under 5 ms in the test box.
+- **Approximate queue-age alert:** at least 48 ms apparent Raw Input queue age (the Windows tick-based estimate is coarse).
+- **GUI heartbeat stall:** the application's own GUI-message callbacks stopped publishing a heartbeat for at least 200 ms, as observed by a separate in-process watchdog thread.
+
+The recorder copies up to 10 seconds **before** the trigger and collects up to **5 seconds after** it. Press the global **Mark Now** button while in an active diagnostic mode to create a manual snapshot even if no automatic anomaly is detected. Remain in that mode for five seconds after marking to collect the full post-trigger portion, then select **6. Flight** to inspect.
+
+The Flight screen includes a native Win32 **six-track density timeline**: Raw keyboard, Win32 key messages, characters, mouse reports, watchdog gaps, and anomaly markers. **Zoom + / Zoom -** change the visible span; **Older / Newer** pan through history. Each column represents a small time range; taller bars mean more events in that column. The UI never pretends that application-dispatch timestamps are physical USB report or switch timestamps.
+
+Select **Save Flight Report** or **Export CSV** to write the explicitly chosen file. Without that action, captures remain only in memory. **Reset mode** on Flight discards the current buffered recording; switching diagnostic modes does not silently transfer keyboard history into ordinary comparison/reaction modes. If you switch to Flight before post-roll completes, it freezes early and cannot recover the remaining post-event time.
+
+**Recording privacy:** Raw Input can be delivered to this process while it is not focused when one of the diagnostic modes is selected. Use **test keys only**, never passwords or private chat messages during keyboard/typing sessions. The Flight Recorder saves key identifiers and device handles, *not typed WM_CHAR text*, but those identifiers may still reveal typing. Review exported files before sharing.
+
+**Watchdog limitations:** The watchdog uses a 10 ms sleep in a normal user-mode thread and an atomic heartbeat; it does not set global timer resolution, load a driver, register hooks or create ETW sessions. A long gap indicates that the app's GUI callbacks were not observed promptly; it does **not** establish that USB delivery or the Windows kernel was stalled. An overloaded system may also delay the watchdog itself. The watchdog is enabled only while recording diagnostic modes and is suspended around the application's modal Save dialogs.
 
 ## Mode 1: Input Comparison
 

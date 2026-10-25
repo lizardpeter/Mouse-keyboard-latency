@@ -8,6 +8,8 @@ use crate::typing::TypingMonitor;
 use crate::deep_trace::{DeepTrace,TraceEvent};
 use crate::mouse_diagnostics::MouseDiagnostics;
 use crate::polling::PollingMonitor;
+use crate::flight::{FlightRecorder,FlightEvent,Lane,LANES};
+use crate::watchdog::Watchdog;
 use crate::hid_poll::get_hid_polled_interval_ms;
 use std::fmt::Write as _;
 use std::cell::Cell;
@@ -46,6 +48,9 @@ const ID_MODE_REACTION:usize=203; const ID_REACTION_ARM:usize=204;
 const ID_MODE_TYPING:usize=205;
 const ID_MODE_MOUSE:usize=206; const ID_VULKAN_SCENE:usize=207;
 const ID_QUERY_HID:usize=208;
+const ID_MODE_FLIGHT:usize=209; const ID_FLIGHT_MARK:usize=210;
+const ID_FLIGHT_ZOOM_IN:usize=211; const ID_FLIGHT_ZOOM_OUT:usize=212;
+const ID_FLIGHT_BACK:usize=213; const ID_FLIGHT_FORWARD:usize=214;
 const FONT_NORMAL:i32=400; const FONT_BOLD:i32=700;
 const OFN_OVERWRITEPROMPT:u32=2; const OFN_PATHMUSTEXIST:u32=0x800;
 const ERROR_ICON:u32=0x10; const BLACK:u32=0x00251D18;
@@ -193,9 +198,10 @@ struct TypingViews {
     input:H, stats:H, last_gap:H, text_log:H, raw_log:H,
 }
 struct MouseViews{stats:H,recent:H,deep:H}
+struct FlightViews{status:H,markers:H,window:H}
 struct State {
     session:Session, active:bool, labels:Option<Labels>, note:String,
-    mode:usize, groups:[Vec<H>;6],
+    mode:usize, groups:[Vec<H>;7],
     frequency:i64,
     keyboard:KeyboardDiagnostics, os_keys:OsKeyStateMonitor,
     key_views:Option<KeyboardViews>,
@@ -203,6 +209,7 @@ struct State {
     typing:TypingMonitor, typing_views:Option<TypingViews>,
     trace:DeepTrace, mouse_diag:MouseDiagnostics, mouse_views:Option<MouseViews>,
     polling:PollingMonitor,
+    flight:FlightRecorder,flight_views:Option<FlightViews>,watchdog:Watchdog,
 }
 thread_local! {
     static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
@@ -235,6 +242,11 @@ fn record_key_message(msg:u32,wp:WP,lp:LP){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             if app.active && (app.mode==2 || app.mode==4 || app.mode==5) {
+                // Mouse mode records mouse motion, not a second typed-key history.
+                if app.mode==2 || app.mode==4 {
+                    app.flight.observe(FlightEvent::new(t,Lane::WinKey,tag,wp as u16,0,
+                        (lp as u64 & 0xffff) as i32,age));
+                }
                 app.trace.record(TraceEvent::keyboard_msg(t,tag,wp,lp,age,queued,first_pending_raw_size()));
             }
         }
@@ -301,6 +313,11 @@ fn get_text(hwnd:H)->String {
 /// Observe real character messages delivered to the native test EDIT control.
 /// Only this specific, focused textbox is subclassed; no global Windows hooks.
 unsafe extern "system" fn typing_edit_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP {
+    STATE.with(|cell|{
+        if let Ok(state)=cell.try_borrow(){
+            if let Some(app)=state.as_ref(){app.watchdog.beat(now());}
+        }
+    });
     if matches!(msg,WM_KEYDOWN|WM_KEYUP|WM_SYSKEYDOWN|WM_SYSKEYUP){
         record_key_message(msg,wp,lp);
     }
@@ -309,6 +326,8 @@ unsafe extern "system" fn typing_edit_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP {
         STATE.with(|cell|{
             if let Some(app)=cell.borrow_mut().as_mut(){
                 if app.mode==4 && app.active {
+                    app.flight.observe(FlightEvent::new(
+                        tick,Lane::Char,"WM_CHAR",0,0,0,0));
                     app.typing.character(wp as u16,tick);
                 }
             }
@@ -361,13 +380,16 @@ fn key_name(vk:u16,scan:u16,flags:u16)->String {
 
 fn mode_title(m:usize)->&'static str {
     match m { 1=>"1 · Input comparison",2=>"2 · Keyboard diagnostics",
-        3=>"3 · Mouse reaction time",4=>"4 · Typing test",5=>"5 · Mouse diagnostics",_=>"Unknown" }
+        3=>"3 · Mouse reaction time",4=>"4 · Typing test",5=>"5 · Mouse diagnostics",6=>"6 · Flight recorder",_=>"Unknown" }
 }
 fn select_mode(hwnd:H,new_mode:usize){
     STATE.with(|cell|{
         let mut cell=cell.borrow_mut();
         let Some(app)=cell.as_mut()else{return};
         app.session.break_pair();
+        if app.mode!=new_mode && matches!(app.mode,2|4|5) {
+            app.flight.finish_early();
+        }
         if app.mode!=new_mode {
             // Explicit diagnostic-mode selection is the privacy boundary:
             // do not carry key histories between unrelated capture sessions.
@@ -377,6 +399,7 @@ fn select_mode(hwnd:H,new_mode:usize){
                 app.mouse_diag=MouseDiagnostics::new(app.frequency,now());
             }
         }
+        app.watchdog.set_active(app.active && matches!(new_mode,2|4|5),now());
         if app.mode!=new_mode && (app.mode==2 || app.mode==4 || new_mode==2 || new_mode==4) {
             app.keyboard.suspend();
             app.os_keys.clear_pending();
@@ -389,6 +412,7 @@ fn select_mode(hwnd:H,new_mode:usize){
             3=>"Click Start trial, wait for GREEN, then click the colored panel.".into(),
             4=>"Click the typing box and type test text. Watch both WM_CHAR and Raw Input timings.".into(),
             5=>"Move the mouse continuously. Compare raw report spacing with sampled Windows pointer movement.".into(),
+            6=>"Inspect frozen evidence. Zoom or pan. Export only after reviewing privacy notice.".into(),
             _=>String::new(),
         };
         for (i,group) in app.groups.iter().enumerate(){
@@ -449,6 +473,84 @@ fn arm_reaction(hwnd:H){
     unsafe{InvalidateRect(hwnd,null(),1);}
     refresh();
 }
+fn draw_flight_chart(dc:H){
+    STATE.with(|cell|{
+        let state=cell.borrow();
+        let Some(app)=state.as_ref() else{return};
+        if app.mode!=6{return;}
+        let width=735usize;
+        let end=app.flight.current_end(now());
+        let histogram=app.flight.histogram(end,width);
+        let colors=[0x00b78516u32,0x00a65f76,0x00a53d16,
+            0x00a29030,0x00664bd3,0x00169add];
+        let brushes:Vec<H>=colors.iter().map(|c|unsafe{CreateSolidBrush(*c)}).collect();
+        let backdrop=unsafe{CreateSolidBrush(0x00f1eae3)};
+        let grid=unsafe{CreateSolidBrush(0x00dfd8d2)};
+        let tick=(app.flight.width_ms/1000.0)/6.0;
+        for lane in 0..LANES{
+            let y=395+(lane as i32)*61;
+            let bg=Rect{left:155,top:y,right:895,bottom:y+43};
+            unsafe{FillRect(dc,&bg,backdrop);}
+            let label=["RAW KEY","WIN32 KEY","WM_CHAR",
+                "MOUSE","GUI GAP","ANOMALY"][lane];
+            let mut name=Rect{left:33,top:y+8,right:150,bottom:y+41};
+            unsafe{
+                SetBkMode(dc,1);SetTextColor(dc,0x0043362e);
+                DrawTextW(dc,wide(label).as_ptr(),-1,&mut name,0);
+            }
+            for x in 0..=6{
+                let gx=155+((width*x)/6) as i32;
+                unsafe{FillRect(dc,&Rect{left:gx,top:y,right:gx+1,bottom:y+43},grid);}
+            }
+            for (col,row) in histogram.iter().enumerate(){
+                let count=row[lane];
+                if count==0{continue;}
+                let height=((count as i32)*4).clamp(4,40);
+                let gx=155+col as i32;
+                let bar=Rect{left:gx,top:y+42-height,right:gx+1,bottom:y+42};
+                unsafe{FillRect(dc,&bar,brushes[lane]);}
+            }
+        }
+        for i in 0..=6{
+            let x=155+(width*i/6) as i32;
+            let offset=(6-i) as f64*tick;
+            let mut rect=Rect{left:x.saturating_sub(24),top:765,right:x+42,bottom:786};
+            unsafe{
+                SetTextColor(dc,0x0043362e);
+                DrawTextW(dc,wide(&format!("-{offset:.2}s")).as_ptr(),-1,&mut rect,0);
+            }
+        }
+        let mut info=Rect{left:155,top:363,right:890,bottom:388};
+        unsafe{
+            DrawTextW(dc,wide("Left: older  /  Right: newer  |  bar height = events per pixel").as_ptr(),
+                -1,&mut info,0);
+            for b in brushes {DeleteObject(b);}
+            DeleteObject(backdrop);DeleteObject(grid);
+        }
+    });
+}
+fn flight_action(hwnd:H,id:usize){
+    STATE.with(|cell|{
+        if let Some(app)=cell.borrow_mut().as_mut(){
+            match id{
+                ID_FLIGHT_MARK=>{
+                    if app.active && matches!(app.mode,2|4|5|6){
+                        app.flight.manual_capture(now());
+                        if app.mode==6{app.flight.finish_early();}
+                        app.note="Manual flight marker recorded in memory. Keep diagnostic test running for 5s, then open Flight tab.".into();
+                    }else{app.note="Select Keyboard, Typing, or Mouse to start a diagnostic capture.".into();}
+                },
+                ID_FLIGHT_ZOOM_IN=>app.flight.zoom(true),
+                ID_FLIGHT_ZOOM_OUT=>app.flight.zoom(false),
+                ID_FLIGHT_BACK=>app.flight.pan(true),
+                ID_FLIGHT_FORWARD=>app.flight.pan(false),
+                _=>{},
+            }
+        }
+    });
+    unsafe{InvalidateRect(hwnd,null(),0);}
+    refresh();
+}
 fn paint_reaction(hwnd:H) {
     // Paint submission is our local timing reference; physical display scan-out
     // may occur later, so this is NOT photon-verified reaction time.
@@ -482,6 +584,7 @@ fn paint_reaction(hwnd:H) {
             DrawTextW(dc,wide(caption).as_ptr(),-1,&mut rect,0x21|0x4);
         }
     }
+    if mode==6{draw_flight_chart(dc);}
     unsafe{EndPaint(hwnd,&ps);}
     if mode==3 && phase==Phase::PendingPaint{
         STATE.with(|cell|{
@@ -554,6 +657,17 @@ fn refresh() {
             set_text(view.text_log,&app.typing.recent("WM_CHAR",11));
             set_text(view.raw_log,&app.typing.recent("RAW_INPUT",11));
         }
+        if let Some(v)=app.flight_views.as_ref(){
+            if app.mode==6 {
+                set_text(v.status,&app.flight.summary());
+                set_text(v.markers,&app.flight.marker_list());
+                let (start,end)=app.flight.view_bounds_ms(timestamp);
+                set_text(v.window,&format!(
+                    "View {:.3}–{:.3}s | span {:.2}s | pan {:.2}s",
+                    start/1000.0,end/1000.0,
+                    app.flight.width_ms/1000.0,app.flight.pan_ms/1000.0));
+            }
+        }
         if let Some(v)=app.mouse_views.as_ref(){
             if app.mode==5 {
                 set_text(v.stats,&app.polling.gui_mouse(timestamp));
@@ -616,11 +730,14 @@ fn refresh() {
 fn toggle(){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
+            app.watchdog.set_active(!app.active && matches!(app.mode,2|4|5),now());
+            app.flight.clear_temporal_state();
             app.session.break_pair();
             app.keyboard.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.active=!app.active;
+            if !app.active{app.flight.finish_early();}
             app.note=if app.active{
                 "Recording: press LEFT CLICK + SPACE, releasing both before repeating.".into()
             }else{"Paused. Click Start recording when ready.".into()};
@@ -631,7 +748,13 @@ fn toggle(){
 fn reset(){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
+            if matches!(app.mode,2|4|5|6){
+                app.flight=FlightRecorder::new(app.frequency,now());
+                app.watchdog.drain();
+                app.watchdog.set_active(app.active && matches!(app.mode,2|4|5),now());
+            }
             match app.mode{
+                6=>{app.note="Flight recorder cleared; switch to Keyboard, Typing, or Mouse to arm again.".into();},
                 2=>{app.polling=PollingMonitor::new(app.frequency);
                      app.trace=DeepTrace::new(app.frequency,now());
                      app.keyboard=KeyboardDiagnostics::new(app.frequency);
@@ -671,6 +794,8 @@ fn save(hwnd:H){
         let Some(app)=state.as_mut() else {return (false,1,now())};
         let prior=app.active;
         app.active=false;
+        app.flight.finish_early();
+        app.watchdog.set_active(false,now());
         app.session.break_pair();
         (prior,app.mode,now())
     });
@@ -679,6 +804,7 @@ fn save(hwnd:H){
         3=>("reaction_times.csv","Export mouse reaction-time trials"),
         4=>("typing_event_timeline.csv","Export focused typing events and timings"),
         5=>("mouse_diagnostics.csv","Export mouse polling and pointer observations"),
+        6=>("flight_recorder.csv","Export frozen or rolling flight recorder timeline"),
         _=>("mouse_keyboard_results.csv","Export mouse / keyboard comparison"),
     };
     let mut path=[0u16;1024];
@@ -707,6 +833,7 @@ fn save(hwnd:H){
                 3=>app.reaction.save_csv(Path::new(&filename)),
                 4=>app.typing.save_csv(Path::new(&filename)),
                 5=>app.mouse_diag.save_csv(Path::new(&filename)),
+                6=>app.flight.save_csv(Path::new(&filename)),
                 _=>app.session.save_csv(Path::new(&filename)),
             }
         });
@@ -728,6 +855,7 @@ fn save(hwnd:H){
             app.typing.suspend();
             app.session.break_pair();
             app.active=was_active;
+            app.watchdog.set_active(was_active && matches!(app.mode,2|4|5),now());
         }
     });
     refresh();
@@ -749,10 +877,14 @@ fn save_report(hwnd:H) {
     let (was_active, contents)=STATE.with(|cell|{
         let mut state=cell.borrow_mut();
         let Some(app)=state.as_mut() else {return (false,String::new());};
-        if app.mode!=2 && app.mode!=4 && app.mode!=5{return (false,String::new());}
+        if app.mode!=2 && app.mode!=4 && app.mode!=5 && app.mode!=6{return (false,String::new());}
         let previous=app.active;
         app.active=false;
-        let mut snapshot=if app.mode==5 {
+        app.flight.finish_early();
+        app.watchdog.set_active(false,now());
+        let mut snapshot=if app.mode==6 {
+            String::new()
+        }else if app.mode==5 {
             format!("INPUT TIMING LAB — MOUSE DIAGNOSTIC REPORT\nPlatform: {}\n",system_description())
         }else{
             app.keyboard.build_report(now(),&app.os_keys,&system_description())
@@ -763,9 +895,16 @@ fn save_report(hwnd:H) {
             app.typing.append_report(&mut snapshot,&contents);
         }
         if app.mode==5{app.mouse_diag.append_report(&mut snapshot);}
-        app.trace.append_report(&mut snapshot);
-        app.polling.append_report(&mut snapshot,now());
-        append_device_inventory(&app.trace,&mut snapshot);
+        if app.mode==6 {
+            app.flight.append_report(&mut snapshot);
+        }else{
+            app.flight.append_report(&mut snapshot);
+            app.trace.append_report(&mut snapshot);
+        }
+        if app.mode!=6 {
+            app.polling.append_report(&mut snapshot,now());
+            append_device_inventory(&app.trace,&mut snapshot);
+        }
         (previous,snapshot)
     });
     if contents.is_empty(){return;}
@@ -806,6 +945,7 @@ fn save_report(hwnd:H) {
             app.typing.suspend();
             app.session.break_pair();
             app.active=was_active;
+            app.watchdog.set_active(was_active && matches!(app.mode,2|4|5),now());
         }
     });
     refresh();
@@ -820,27 +960,31 @@ unsafe fn make_gui(hwnd:H){
 
     CREATE_GROUP.with(|g|g.set(0));
     text(hwnd,instance,"INPUT TIMING LAB",30,16,860,45,f_title);
-    text(hwnd,instance,"Five passive input tests  •  Native Win32  •  Optional Vulkan scene",
+    text(hwnd,instance,"Six tests  •  Read-only input flight recorder  •  Vulkan game scene",
         32,62,860,24,f_small);
     control(hwnd,instance,"BUTTON","1. Compare",ID_MODE_COMPARE,
-        32,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        32,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","2. Keyboard",ID_MODE_KEYBOARD,
-        210,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        178,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","3. Reaction",ID_MODE_REACTION,
-        388,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        324,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","4. Typing",ID_MODE_TYPING,
-        566,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        470,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","5. Mouse",ID_MODE_MOUSE,
-        744,102,160,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        616,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","6. Flight",ID_MODE_FLIGHT,
+        762,102,142,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     let start=control(hwnd,instance,"BUTTON","Pause",ID_START,
-        31,163,155,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        31,163,110,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","Reset mode",ID_RESET,
-        205,163,135,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        150,163,110,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","Export CSV",ID_SAVE,
-        357,163,130,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    let recording=text(hwnd,instance,"",670,167,255,32,f_small);
+        268,163,109,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","Mark Now",ID_FLIGHT_MARK,
+        385,163,104,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    let recording=text(hwnd,instance,"",665,167,255,32,f_small);
     control(hwnd,instance,"BUTTON","Open Vulkan Scene",ID_VULKAN_SCENE,
-        497,163,161,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+        498,163,158,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
 
     CREATE_GROUP.with(|g|g.set(1));
     text(hwnd,instance,"LIVE MOUSE · LEFT CLICK",32,229,410,27,f_medium);
@@ -952,9 +1096,32 @@ unsafe fn make_gui(hwnd:H){
     let mouse_deep=text(hwnd,instance,"",32,847,870,50,f_small);
     text(hwnd,instance,"Open Vulkan Scene, then M for live cyan raw-counts vs orange Windows pointer markers.",
         32,905,870,25,f_small);
+    CREATE_GROUP.with(|g|g.set(6));
+    text(hwnd,instance,"ANOMALY FLIGHT RECORDER",32,230,870,35,f_title);
+    text(hwnd,instance,"Capture is memory-only. Start on Keyboard, Typing or Mouse; switch here to inspect.",
+        32,271,640,25,f_small);
+    control(hwnd,instance,"BUTTON","Save Flight Report",ID_DIAGNOSTIC_REPORT,
+        685,264,218,41,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    let flight_status=text(hwnd,instance,"",32,310,860,25,f_small);
+    control(hwnd,instance,"BUTTON","Zoom +",ID_FLIGHT_ZOOM_IN,
+        32,337,104,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","Zoom -",ID_FLIGHT_ZOOM_OUT,
+        144,337,104,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","Older <<",ID_FLIGHT_BACK,
+        256,337,112,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","Newer >>",ID_FLIGHT_FORWARD,
+        376,337,112,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    let flight_window=text(hwnd,instance,"",496,339,406,27,f_small);
+    text(hwnd,instance,"CAPTURE MARKERS / AUTOMATIC DETECTIONS",32,794,865,24,f_medium);
+    let flight_markers=control(hwnd,instance,"EDIT","",0,
+        32,822,870,80,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
+    text(hwnd,instance,"Bars are host-delivery timestamps, not USB packet timestamps. Save only after reviewing key identifiers.",
+        32,908,870,23,f_small);
+
     CREATE_GROUP.with(|g|g.set(0));
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
+            app.flight_views=Some(FlightViews{status:flight_status,markers:flight_markers,window:flight_window});
             app.labels=Some(Labels{
                 start,recording,
                 mouse_count,mouse_last,mouse_age,mouse_interval,
@@ -976,6 +1143,13 @@ unsafe fn make_gui(hwnd:H){
     select_mode(hwnd,1);
 }
 unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
+    // A heartbeat is published on each GUI callback, not just WM_TIMER.
+    // WM_TIMER is low priority when input is saturated.
+    STATE.with(|cell|{
+        if let Ok(state)=cell.try_borrow(){
+            if let Some(app)=state.as_ref(){app.watchdog.beat(now());}
+        }
+    });
     if matches!(msg,WM_KEYDOWN|WM_KEYUP|WM_SYSKEYDOWN|WM_SYSKEYUP) {
         record_key_message(msg,wp,lp);
     }
@@ -1007,6 +1181,15 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                             app.mouse_diag.observe(tick,raw.header.device as usize,
                                 mouse.last_x,mouse.last_y,mouse.flags&1!=0,
                                 mouse.buttons as u16,p.x,p.y);
+                        }
+                        if app.mode==5 ||
+                            ((app.mode==2||app.mode==4) && mouse.buttons as u16!=0)
+                        {
+                            app.flight.observe(FlightEvent::new(tick,Lane::Mouse,
+                                if mouse.buttons as u16!=0{"BUTTON"}else{"MOVE"},
+                                0,raw.header.device as usize,
+                                mouse.last_x.saturating_abs().saturating_add(
+                                    mouse.last_y.saturating_abs()),age));
                         }
                         // In keyboard/typing tests preserve trace capacity for
                         // keyboard events and intentional mouse-button markers.
@@ -1060,6 +1243,12 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                                 let scan=if key.make==0{key.key}else{key.make};
                                 let id=KeyId::new(scan,key.flags);
                                 let delay=age;
+                                let was_held=down && app.keyboard.observed_vk_states()
+                                    .iter().any(|(vk,_,held)|*vk==key.key && *held);
+                                app.flight.observe(FlightEvent::new(
+                                    tick,Lane::RawKey,
+                                    if !down{"UP"}else if was_held{"REPEAT"}else{"DOWN"},
+                                    key.key,raw.header.device as usize,0,delay));
                                 app.keyboard.observe_queue_age(delay);
                                 let label=key_name(key.key,scan,key.flags);
                                 if app.mode==4 {
@@ -1096,6 +1285,9 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                 ID_MODE_TYPING=>select_mode(hwnd,4),
                 ID_REACTION_ARM=>arm_reaction(hwnd),
                 ID_MODE_MOUSE=>select_mode(hwnd,5),
+                ID_MODE_FLIGHT=>select_mode(hwnd,6),
+                ID_FLIGHT_MARK|ID_FLIGHT_ZOOM_IN|ID_FLIGHT_ZOOM_OUT|
+                    ID_FLIGHT_BACK|ID_FLIGHT_FORWARD=>flight_action(hwnd,id),
                 ID_QUERY_HID=>query_hid(),
                 ID_VULKAN_SCENE=>{
                     match std::env::current_exe().and_then(|exe|
@@ -1126,7 +1318,19 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
             let changed=STATE.with(|cell|{
                 let mut state=cell.borrow_mut();
                 let Some(app)=state.as_mut()else{return false};
-                if !app.active{return false;}
+                if !app.active {
+                    app.watchdog.drain();
+                    return false;
+                }
+                let when=now();
+                app.flight.finish(when);
+                for gap in app.watchdog.drain(){
+                    if matches!(app.mode,2|4|5){
+                        app.flight.observe(FlightEvent::new(gap.ended,
+                            Lane::Watchdog,"GUI_STALL",0,0,
+                            gap.duration_ms.round() as i32,0));
+                    }
+                }
                 if app.mode==2 || app.mode==4 {
                     let when=now();
                     let observed=app.keyboard.observed_vk_states();
@@ -1171,6 +1375,8 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             trace:DeepTrace::new(frequency,now()),
             mouse_diag:MouseDiagnostics::new(frequency,now()),mouse_views:None,
             polling:PollingMonitor::new(frequency),
+            flight:FlightRecorder::new(frequency,now()),flight_views:None,
+            watchdog:Watchdog::new(frequency,now),
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");
