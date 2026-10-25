@@ -708,6 +708,7 @@ fn save(hwnd:H){
         let Some(app)=state.as_mut() else {return (false,1,now())};
         let prior=app.active;
         app.active=false;
+        app.watchdog.set_active(false,now());
         app.session.break_pair();
         (prior,app.mode,now())
     });
@@ -767,6 +768,7 @@ fn save(hwnd:H){
             app.typing.suspend();
             app.session.break_pair();
             app.active=was_active;
+            app.watchdog.set_active(was_active && matches!(app.mode,2|4|5),now());
         }
     });
     refresh();
@@ -791,6 +793,7 @@ fn save_report(hwnd:H) {
         if app.mode!=2 && app.mode!=4 && app.mode!=5 && app.mode!=6{return (false,String::new());}
         let previous=app.active;
         app.active=false;
+        app.watchdog.set_active(false,now());
         let mut snapshot=if app.mode==6 {
             String::new()
         }else if app.mode==5 {
@@ -854,6 +857,7 @@ fn save_report(hwnd:H) {
             app.typing.suspend();
             app.session.break_pair();
             app.active=was_active;
+            app.watchdog.set_active(was_active && matches!(app.mode,2|4|5),now());
         }
     });
     refresh();
