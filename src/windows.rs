@@ -5,6 +5,9 @@ use crate::core::{Kind, Session, DeviceSnapshot};
 use crate::keyboard::{KeyboardDiagnostics,KeyId,OsKeyStateMonitor};
 use crate::reaction::{ReactionTest,Phase};
 use crate::typing::TypingMonitor;
+use crate::deep_trace::{DeepTrace,TraceEvent};
+use crate::mouse_diagnostics::MouseDiagnostics;
+use std::fmt::Write as _;
 use std::cell::Cell;
 use std::{cell::RefCell, ffi::c_void, io, mem::{size_of, zeroed}, path::Path,
     ptr::{null, null_mut}};
@@ -18,6 +21,9 @@ const WM_INPUT:u32=0xFF; const WM_TIMER:u32=0x113; const WM_SETFONT:u32=0x30;
 const WM_CTLCOLORSTATIC:u32=0x138; const WM_ERASEBKGND:u32=0x14;
 const WM_SIZE:u32=5; const WM_KEYDOWN:u32=0x100; const WM_PAINT:u32=0x0F;
 const WM_CHAR:u32=0x102; const GWLP_WNDPROC:i32=-4;
+const WM_KEYUP:u32=0x101; const WM_SYSKEYDOWN:u32=0x104; const WM_SYSKEYUP:u32=0x105;
+const QS_KEY:u32=1; const QS_RAWINPUT:u32=0x400;
+const RIDI_DEVICENAME:u32=0x20000007;
 const WS_VSCROLL:u32=0x00200000;
 const ES_MULTILINE:u32=0x0004; const ES_AUTOVSCROLL:u32=0x0040;
 const ES_WANTRETURN:u32=0x1000; const ES_READONLY:u32=0x0800;
@@ -36,6 +42,7 @@ const ID_TYPING_TEXTLOG:usize=307; const ID_TYPING_RAWLOG:usize=308;
 const ID_MODE_COMPARE:usize=201; const ID_MODE_KEYBOARD:usize=202;
 const ID_MODE_REACTION:usize=203; const ID_REACTION_ARM:usize=204;
 const ID_MODE_TYPING:usize=205;
+const ID_MODE_MOUSE:usize=206; const ID_VULKAN_SCENE:usize=207;
 const FONT_NORMAL:i32=400; const FONT_BOLD:i32=700;
 const OFN_OVERWRITEPROMPT:u32=2; const OFN_PATHMUSTEXIST:u32=0x800;
 const ERROR_ICON:u32=0x10; const BLACK:u32=0x00251D18;
@@ -99,6 +106,7 @@ extern "system" {
     fn PostQuitMessage(code:i32);
     fn RegisterRawInputDevices(devices:*const RawDevice,count:u32,size:u32)->i32;
     fn GetRawInputData(handle:H,command:u32,out:H,bytes:*mut u32,header:u32)->u32;
+    fn GetRawInputBuffer(data:H,bytes:*mut u32,header:u32)->u32;
     fn SetWindowTextW(hwnd:H,text:*const u16)->i32;
     fn SetWindowLongPtrW(hwnd:H,index:i32,new_ptr:isize)->isize;
     fn CallWindowProcW(prev:isize,hwnd:H,msg:u32,wp:WP,lp:LP)->LP;
@@ -121,6 +129,8 @@ extern "system" {
     fn MessageBoxW(hwnd:H,text:*const u16,caption:*const u16,flags:u32)->i32;
     fn GetAsyncKeyState(virtual_key:i32)->i16;
     fn GetMessageTime()->i32;
+    fn GetQueueStatus(flags:u32)->u32;
+    fn GetRawInputDeviceInfoW(device:H,command:u32,out:H,size:*mut u32)->u32;
     fn SetBkMode(dc:H,mode:i32)->i32;
     fn SetTextColor(dc:H,color:u32)->u32;
 }
@@ -179,14 +189,16 @@ struct ReactionViews {
 struct TypingViews {
     input:H, stats:H, last_gap:H, text_log:H, raw_log:H,
 }
+struct MouseViews{stats:H,recent:H,deep:H}
 struct State {
     session:Session, active:bool, labels:Option<Labels>, note:String,
-    mode:usize, groups:[Vec<H>;5],
+    mode:usize, groups:[Vec<H>;6],
     frequency:i64,
     keyboard:KeyboardDiagnostics, os_keys:OsKeyStateMonitor,
     key_views:Option<KeyboardViews>,
     reaction:ReactionTest, reaction_views:Option<ReactionViews>,
     typing:TypingMonitor, typing_views:Option<TypingViews>,
+    trace:DeepTrace, mouse_diag:MouseDiagnostics, mouse_views:Option<MouseViews>,
 }
 thread_local! {
     static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
@@ -195,6 +207,66 @@ thread_local! {
 }
 
 fn now()->i64 {let mut v=0; unsafe{QueryPerformanceCounter(&mut v);} v}
+fn queue_bits()->u32 {
+    // High word shows present queue bits. GetQueueStatus does not remove messages.
+    unsafe{GetQueueStatus(QS_KEY|QS_RAWINPUT)>>16}
+}
+fn first_pending_raw_size()->u32{
+    // Null-output size QUERY ONLY: does not drain/remove any Raw Input records.
+    // Reports size of the FIRST waiting record, not number or total bytes.
+    let mut bytes=0u32;
+    unsafe{GetRawInputBuffer(null_mut(),&mut bytes,size_of::<RawHeader>() as u32);}
+    bytes
+}
+fn message_age()->u32{
+    unsafe{(GetTickCount64() as u32).wrapping_sub(GetMessageTime() as u32)}
+}
+fn record_key_message(msg:u32,wp:WP,lp:LP){
+    let tag=match msg {
+        WM_KEYDOWN=>"WM_KEYDOWN",WM_KEYUP=>"WM_KEYUP",
+        WM_SYSKEYDOWN=>"WM_SYSKEYDOWN",WM_SYSKEYUP=>"WM_SYSKEYUP",
+        _=>return
+    };
+    let t=now();let queued=queue_bits();let age=message_age();
+    STATE.with(|cell|{
+        if let Some(app)=cell.borrow_mut().as_mut(){
+            if app.active && (app.mode==2 || app.mode==4 || app.mode==5) {
+                app.trace.record(TraceEvent::keyboard_msg(t,tag,wp,lp,age,queued,first_pending_raw_size()));
+            }
+        }
+    });
+}
+fn append_device_inventory(trace:&DeepTrace,out:&mut String){
+    use std::collections::BTreeSet;
+    let devices: BTreeSet<usize>=trace.events.iter().filter_map(|e|
+        (e.device!=0).then_some(e.device)).collect();
+    let _=writeln!(out,"\nRAW INPUT DEVICE IDENTIFIERS (device serial/path redacted)");
+    for device in devices {
+        let mut size=0u32;
+        let rc=unsafe{GetRawInputDeviceInfoW(device as H,RIDI_DEVICENAME,null_mut(),&mut size)};
+        if rc==u32::MAX || size==0 || size>8192 {
+            let _=writeln!(out,"device_handle=0x{device:x} VID/PID unavailable");
+            continue;
+        }
+        let mut buffer=vec![0u16;size as usize];
+        let read=unsafe{GetRawInputDeviceInfoW(device as H,RIDI_DEVICENAME,
+            buffer.as_mut_ptr().cast(),&mut size)};
+        if read==u32::MAX {
+            let _=writeln!(out,"device_handle=0x{device:x} VID/PID unavailable");
+            continue;
+        }
+        let path=String::from_utf16_lossy(&buffer[..(read as usize).min(buffer.len())]);
+        let up=path.to_ascii_uppercase();
+        let token=|tag:&str|{
+            up.find(tag).and_then(|start|up.get(start+tag.len()..start+tag.len()+4))
+                .filter(|x|x.chars().all(|c|c.is_ascii_hexdigit()))
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        let _=writeln!(out,"device_handle=0x{device:x} VID={} PID={}",token("VID_"),token("PID_"));
+    }
+}
+
 unsafe fn control(parent:H,instance:H,class:&str,text:&str,id:usize,
     x:i32,y:i32,w:i32,h:i32,style:u32,font:H)->H {
     let hwnd=CreateWindowExW(0,wide(class).as_ptr(),wide(text).as_ptr(),
@@ -225,6 +297,9 @@ fn get_text(hwnd:H)->String {
 /// Observe real character messages delivered to the native test EDIT control.
 /// Only this specific, focused textbox is subclassed; no global Windows hooks.
 unsafe extern "system" fn typing_edit_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP {
+    if matches!(msg,WM_KEYDOWN|WM_KEYUP|WM_SYSKEYDOWN|WM_SYSKEYUP){
+        record_key_message(msg,wp,lp);
+    }
     if msg==WM_CHAR {
         let tick=now();
         STATE.with(|cell|{
@@ -282,13 +357,21 @@ fn key_name(vk:u16,scan:u16,flags:u16)->String {
 
 fn mode_title(m:usize)->&'static str {
     match m { 1=>"1 · Input comparison",2=>"2 · Keyboard diagnostics",
-        3=>"3 · Mouse reaction time",4=>"4 · Typing test",_=>"Unknown" }
+        3=>"3 · Mouse reaction time",4=>"4 · Typing test",5=>"5 · Mouse diagnostics",_=>"Unknown" }
 }
 fn select_mode(hwnd:H,new_mode:usize){
     STATE.with(|cell|{
         let mut cell=cell.borrow_mut();
         let Some(app)=cell.as_mut()else{return};
         app.session.break_pair();
+        if app.mode!=new_mode {
+            // Explicit diagnostic-mode selection is the privacy boundary:
+            // do not carry key histories between unrelated capture sessions.
+            app.trace=DeepTrace::new(app.frequency,now());
+            if new_mode==5 {
+                app.mouse_diag=MouseDiagnostics::new(app.frequency,now());
+            }
+        }
         if app.mode!=new_mode && (app.mode==2 || app.mode==4 || new_mode==2 || new_mode==4) {
             app.keyboard.suspend();
             app.os_keys.clear_pending();
@@ -300,6 +383,7 @@ fn select_mode(hwnd:H,new_mode:usize){
             2=>"Test key combinations; press and release keys to watch their states.".into(),
             3=>"Click Start trial, wait for GREEN, then click the colored panel.".into(),
             4=>"Click the typing box and type test text. Watch both WM_CHAR and Raw Input timings.".into(),
+            5=>"Move the mouse continuously. Compare raw report spacing with sampled Windows pointer movement.".into(),
             _=>String::new(),
         };
         for (i,group) in app.groups.iter().enumerate(){
@@ -435,6 +519,13 @@ fn refresh() {
             set_text(view.text_log,&app.typing.recent("WM_CHAR",11));
             set_text(view.raw_log,&app.typing.recent("RAW_INPUT",11));
         }
+        if let Some(v)=app.mouse_views.as_ref(){
+            if app.mode==5 {
+                set_text(v.stats,&app.mouse_diag.live_stats());
+                set_text(v.recent,&app.mouse_diag.recent());
+                set_text(v.deep,&app.trace.summary());
+            }
+        }
         if let Some(k)=app.key_views.as_ref(){
             let kd=&app.keyboard;
             set_text(k.counters,&format!(
@@ -505,12 +596,17 @@ fn reset(){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             match app.mode{
-                2=>{app.keyboard=KeyboardDiagnostics::new(app.frequency);
+                2=>{app.trace=DeepTrace::new(app.frequency,now());
+                     app.keyboard=KeyboardDiagnostics::new(app.frequency);
                     app.os_keys=OsKeyStateMonitor::new(now(),app.frequency);
                     app.note="Keyboard diagnostics and Windows state checks cleared.".into();},
+                5=>{app.mouse_diag=MouseDiagnostics::new(app.frequency,now());
+                     app.trace=DeepTrace::new(app.frequency,now());
+                     app.note="Mouse motion and queue observations reset.".into();},
                 3=>{app.reaction.reset();
                     app.note="Reaction results cleared.".into();},
                 4=>{
+                    app.trace=DeepTrace::new(app.frequency,now());
                     app.typing=TypingMonitor::new(app.frequency,now());
                     app.keyboard=KeyboardDiagnostics::new(app.frequency);
                     app.os_keys=OsKeyStateMonitor::new(now(),app.frequency);
@@ -543,6 +639,7 @@ fn save(hwnd:H){
         2=>("keyboard_diagnostics.csv","Export complete keyboard diagnostic history"),
         3=>("reaction_times.csv","Export mouse reaction-time trials"),
         4=>("typing_event_timeline.csv","Export focused typing events and timings"),
+        5=>("mouse_diagnostics.csv","Export mouse polling and pointer observations"),
         _=>("mouse_keyboard_results.csv","Export mouse / keyboard comparison"),
     };
     let mut path=[0u16;1024];
@@ -570,6 +667,7 @@ fn save(hwnd:H){
                 2=>app.keyboard.save_csv(Path::new(&filename),snapshot_ticks),
                 3=>app.reaction.save_csv(Path::new(&filename)),
                 4=>app.typing.save_csv(Path::new(&filename)),
+                5=>app.mouse_diag.save_csv(Path::new(&filename)),
                 _=>app.session.save_csv(Path::new(&filename)),
             }
         });
@@ -612,15 +710,22 @@ fn save_report(hwnd:H) {
     let (was_active, contents)=STATE.with(|cell|{
         let mut state=cell.borrow_mut();
         let Some(app)=state.as_mut() else {return (false,String::new());};
-        if app.mode!=2 && app.mode!=4{return (false,String::new());}
+        if app.mode!=2 && app.mode!=4 && app.mode!=5{return (false,String::new());}
         let previous=app.active;
         app.active=false;
-        let mut snapshot=app.keyboard.build_report(now(),&app.os_keys,&system_description());
+        let mut snapshot=if app.mode==5 {
+            format!("INPUT TIMING LAB — MOUSE DIAGNOSTIC REPORT\nPlatform: {}\n",system_description())
+        }else{
+            app.keyboard.build_report(now(),&app.os_keys,&system_description())
+        };
         if app.typing.chars>0 || app.mode==4 {
             let contents=app.typing_views.as_ref()
                 .map_or_else(String::new,|view|get_text(view.input));
             app.typing.append_report(&mut snapshot,&contents);
         }
+        if app.mode==5{app.mouse_diag.append_report(&mut snapshot);}
+        app.trace.append_report(&mut snapshot);
+        append_device_inventory(&app.trace,&mut snapshot);
         (previous,snapshot)
     });
     if contents.is_empty(){return;}
@@ -675,23 +780,27 @@ unsafe fn make_gui(hwnd:H){
 
     CREATE_GROUP.with(|g|g.set(0));
     text(hwnd,instance,"INPUT TIMING LAB",30,16,860,45,f_title);
-    text(hwnd,instance,"Three tests in one app  •  Win32 Raw Input  •  Live results without exporting files",
+    text(hwnd,instance,"Five passive input tests  •  Native Win32  •  Optional Vulkan scene",
         32,62,860,24,f_small);
-    control(hwnd,instance,"BUTTON","1. Comparison",ID_MODE_COMPARE,
-        32,102,205,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","1. Compare",ID_MODE_COMPARE,
+        32,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     control(hwnd,instance,"BUTTON","2. Keyboard",ID_MODE_KEYBOARD,
-        250,102,205,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        210,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     control(hwnd,instance,"BUTTON","3. Reaction",ID_MODE_REACTION,
-        468,102,205,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    control(hwnd,instance,"BUTTON","4. Typing Test",ID_MODE_TYPING,
-        686,102,218,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        388,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","4. Typing",ID_MODE_TYPING,
+        566,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    control(hwnd,instance,"BUTTON","5. Mouse",ID_MODE_MOUSE,
+        744,102,160,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     let start=control(hwnd,instance,"BUTTON","Pause",ID_START,
         31,163,155,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     control(hwnd,instance,"BUTTON","Reset mode",ID_RESET,
         205,163,135,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     control(hwnd,instance,"BUTTON","Export CSV",ID_SAVE,
         357,163,130,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    let recording=text(hwnd,instance,"",500,167,415,32,f_medium);
+    let recording=text(hwnd,instance,"",670,167,255,32,f_small);
+    control(hwnd,instance,"BUTTON","Open Vulkan Scene",ID_VULKAN_SCENE,
+        497,163,161,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
 
     CREATE_GROUP.with(|g|g.set(1));
     text(hwnd,instance,"LIVE MOUSE · LEFT CLICK",32,229,410,27,f_medium);
@@ -748,6 +857,8 @@ unsafe fn make_gui(hwnd:H){
     let arm_button=control(hwnd,instance,"BUTTON","Start trial",ID_REACTION_ARM,
         32,274,185,37,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
     let status=text(hwnd,instance,"Ready. Click Start trial.",231,277,675,32,f_medium);
+    text(hwnd,instance,"Native Vulkan scene: Open Vulkan Scene (above), F1–F8 adjust FPS cap.",
+        32,318,870,26,f_small);
     // The colored test area is painted by WM_PAINT, not a STATIC child.
     text(hwnd,instance,"REACTION RESULTS — milliseconds",32,620,830,28,f_medium);
     let last=text(hwnd,instance,"Last result: —",32,662,410,36,f_large);
@@ -781,6 +892,21 @@ unsafe fn make_gui(hwnd:H){
     let typed_raw=control(hwnd,instance,"EDIT","",ID_TYPING_RAWLOG,
         32,813,870,105,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
 
+    CREATE_GROUP.with(|g|g.set(5));
+    text(hwnd,instance,"RAW MOUSE POLLING / WINDOWS CURSOR",32,230,870,35,f_title);
+    text(hwnd,instance,"Keep moving the mouse. Report spacing is not guaranteed device polling frequency.",
+        32,277,625,38,f_small);
+    control(hwnd,instance,"BUTTON","Save Diagnostic Report",ID_DIAGNOSTIC_REPORT,
+        672,275,232,39,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    text(hwnd,instance,"LIVE RAW MOUSE STATISTICS",32,333,870,28,f_medium);
+    let mouse_stats=text(hwnd,instance,"",32,375,860,106,f_medium);
+    text(hwnd,instance,"LATEST RAW DELTAS vs SAMPLED WINDOWS CURSOR COORDINATES",
+        32,505,870,28,f_medium);
+    let mouse_recent=control(hwnd,instance,"EDIT","",0,
+        32,550,870,285,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
+    let mouse_deep=text(hwnd,instance,"",32,847,870,50,f_small);
+    text(hwnd,instance,"Open Vulkan Scene, then M for live cyan raw-counts vs orange Windows pointer markers.",
+        32,905,870,25,f_small);
     CREATE_GROUP.with(|g|g.set(0));
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
@@ -795,6 +921,7 @@ unsafe fn make_gui(hwnd:H){
                 action:arm_button,
                 status,stats:rx_stats,last,recent:rx_recent,
             });
+            app.mouse_views=Some(MouseViews{stats:mouse_stats,recent:mouse_recent,deep:mouse_deep});
             app.typing_views=Some(TypingViews{
                 input:typing_input,stats:typing_stats,last_gap:typing_gap,
                 text_log:typed_chars,raw_log:typed_raw,
@@ -804,6 +931,9 @@ unsafe fn make_gui(hwnd:H){
     select_mode(hwnd,1);
 }
 unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
+    if matches!(msg,WM_KEYDOWN|WM_KEYUP|WM_SYSKEYDOWN|WM_SYSKEYUP) {
+        record_key_message(msg,wp,lp);
+    }
     match msg{
         WM_CREATE=>{make_gui(hwnd);return 0;}
         WM_INPUT=>{
@@ -819,6 +949,31 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                     let mut state=cell.borrow_mut();
                     let Some(app)=state.as_mut()else{return};
                     if !app.active{return};
+                    let bits=queue_bits();
+                    let age=message_age();
+                    app.trace.observe_dispatch(tick,bits);
+                    if raw.header.kind==0{
+                        let mouse=raw.data.mouse;
+                        let mut p=Point::default();
+                        if GetCursorPos(&mut p)!=0{ScreenToClient(hwnd,&mut p);}
+                        if app.mode==5 {
+                            app.mouse_diag.observe(tick,raw.header.device as usize,
+                                mouse.last_x,mouse.last_y,mouse.flags&1!=0,
+                                mouse.buttons as u16,p.x,p.y);
+                        }
+                        // In keyboard/typing tests preserve trace capacity for
+                        // keyboard events and intentional mouse-button markers.
+                        // High-Hz mouse movement can otherwise exhaust 100k rows quickly.
+                        if app.mode==5 || ((app.mode==2 || app.mode==4) && mouse.buttons as u16!=0) {
+                            app.trace.record(TraceEvent::raw(tick,"RAW_MOUSE",0,0,
+                                age,bits,raw.header.device as usize,
+                                mouse.last_x,mouse.last_y,p.x,p.y,mouse.buttons as u16,0));
+                        }
+                    } else if raw.header.kind==1 && (app.mode==2 || app.mode==4 || app.mode==5) {
+                        let k=raw.data.key;
+                        app.trace.record(TraceEvent::raw(tick,"RAW_KEY",k.key,k.make,
+                            age,bits,raw.header.device as usize,0,0,0,0,0,first_pending_raw_size()));
+                    }
                     match raw.header.kind {
                         0 if got as usize>=size_of::<RawHeader>()+size_of::<RawMouse>()=>{
                             let bits=raw.data.mouse.buttons as u16;
@@ -853,7 +1008,7 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                             } else if app.mode==2 || app.mode==4 {
                                 let scan=if key.make==0{key.key}else{key.make};
                                 let id=KeyId::new(scan,key.flags);
-                                let delay=(GetTickCount64() as u32).wrapping_sub(GetMessageTime() as u32);
+                                let delay=age;
                                 app.keyboard.observe_queue_age(delay);
                                 let label=key_name(key.key,scan,key.flags);
                                 if app.mode==4 {
@@ -889,6 +1044,14 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                 ID_MODE_REACTION=>select_mode(hwnd,3),
                 ID_MODE_TYPING=>select_mode(hwnd,4),
                 ID_REACTION_ARM=>arm_reaction(hwnd),
+                ID_MODE_MOUSE=>select_mode(hwnd,5),
+                ID_VULKAN_SCENE=>{
+                    match std::env::current_exe().and_then(|exe|
+                        std::process::Command::new(exe).arg("--vulkan-scene").spawn()) {
+                        Ok(_)=>{},
+                        Err(e)=>error(hwnd,&format!("Could not start Vulkan scene: {e}")),
+                    }
+                },
                 _=>{},
             }
             // Keep the test textbox focused after toolbar commands. Other
@@ -947,12 +1110,14 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
     STATE.with(|cell|{
         *cell.borrow_mut()=Some(State{
             session:Session::new(now(),frequency),active:true,labels:None,
-            note:"Live capture active. Select one of four modes above.".into(),
+            note:"Live capture active. Select a diagnostic mode or open Vulkan Scene.".into(),
             mode:1,groups:std::array::from_fn(|_|Vec::new()),frequency,
             keyboard:KeyboardDiagnostics::new(frequency),
             os_keys:OsKeyStateMonitor::new(now(),frequency),key_views:None,
             reaction:ReactionTest::default(),reaction_views:None,
             typing:TypingMonitor::new(frequency,now()),typing_views:None,
+            trace:DeepTrace::new(frequency,now()),
+            mouse_diag:MouseDiagnostics::new(frequency,now()),mouse_views:None,
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");

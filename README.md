@@ -1,6 +1,6 @@
 # Mouse / Keyboard Input Timing Lab
 
-A native **Windows x64 GUI** built in Rust, with four interactive diagnostic modes. All results appear directly inside the application. CSV export is optional and **exports the currently selected mode**, including the complete keyboard event history.
+A native **Windows x64 GUI** built in Rust, with five interactive diagnostic modes and an optional native Vulkan scene. All results appear directly inside the application. CSV export is optional and **exports the currently selected mode**, including the complete keyboard event history.
 
 ## Download the executable (no Rust required)
 
@@ -9,7 +9,7 @@ A native **Windows x64 GUI** built in Rust, with four interactive diagnostic mod
 3. Under **Artifacts**, download `Mouse-Keyboard-Latency-Windows-GUI`.
 4. Extract the ZIP and double-click `Mouse-Keyboard-Latency.exe`.
 
-The Windows build runs automatically when code is pushed to `main`. It produces a normal desktop GUI `.exe`, not a console program. No drivers, extra DLLs, or Rust installation are needed to run the packaged application.
+The Windows build runs automatically when code is pushed to `main`. It produces a normal desktop GUI `.exe`, not a console program. No driver installation, Rust installation, or Vulkan SDK is required. The optional Vulkan scene dynamically loads the Vulkan runtime provided by the installed graphics driver; if unavailable, the original Win32 diagnostics still run.
 
 ## Mode 1: Input Comparison
 
@@ -73,6 +73,39 @@ This mode is designed for symptoms such as delayed text appearing in **bursts** 
 Important distinction: this tool *does not intercept Chrome/Notepad text output*; that would require hooking or inspecting other processes. Instead it provides an independent test of regular Windows character message delivery in our own focused textbox, with a simultaneous Raw Input stream. Multiple WM_CHAR messages handled close together can be caused by batching, fast software processing, IME or other mechanisms; a short gap alone does not prove a keyboard defect. Pasted text or IME composition changes do not necessarily produce one WM_CHAR per visible character.
 
 For privacy, type **only artificial test sentences**, never passwords or sensitive material. This mode does not install any system-wide keyboard hooks, modify Windows settings, or send input records to a network service. The report and CSV are only created if you choose to save them.
+
+## Mode 5: Mouse Polling / Raw vs Windows Pointer
+
+Move the mouse continuously while keeping **5. Mouse** selected. The app records Windows `WM_INPUT` movement events, their QPC inter-arrival intervals, raw X/Y counts, mouse-button flags, device handles and the Windows cursor coordinates sampled at dispatch. It displays the median-derived observed movement event frequency, median and P95 inter-arrival gaps, and a live event timeline. You can export the observations as CSV or save a report.
+
+**This is not an absolute measurement of the mouse's USB polling rate.** Idle sensors send fewer movement reports, multiple devices can be present, high-frequency arrivals can be batched, and cursor coordinates are affected by pointer settings and DWM. Raw motion counts and cursor pixels cannot be subtracted to calculate input delay.
+
+## Passive Deep Keyboard Trace
+
+While the application is recording, it also captures the `WM_KEYDOWN`/`WM_KEYUP` and `WM_SYSKEYDOWN`/`WM_SYSKEYUP` messages addressed to its own main window or focused test text box, along with:
+
+- QPC event-handling timestamps, approximate `GetMessageTime` age, queued `QS_KEY`/`QS_RAWINPUT` flags and per-message `lParam` repeat count / previous-key-state bits.
+- Matching Win32 Raw Input keyboard and mouse events, raw scan codes, device handles, mouse deltas, mouse buttons (useful as an **independent physical action marker**) and current Windows cursor samples.
+- Up to 100,000 preallocated trace records in memory. The report includes the complete retained timeline.
+- Read-only device identity lookup at report time, exported as **VID/PID only** so keyboard/mouse serial-number paths are not shared.
+
+Observe keyboard message data **only within our own focused app**. There is no mechanism to inspect arbitrary Chrome/CS2 message queues or kernel HID driver buffers from this normal user-mode application. The Raw Input and queue observations cannot time the electrical actuation or switch release.
+
+**Important: read-only policy.** The executable never edits the registry, Windows files, drivers, services, USB controller settings, keyboard-repeat configuration, GPU settings, or power settings. It does not start/stop ETW sessions or install a USB filter. Raw Input registration is process-scoped and stops when the process exits. Exporting CSV/reports writes **only the file you explicitly select** in a Save dialog, not a system file. Graphics drivers may independently maintain their own runtime caches; the application does not write them.
+
+We deliberately **do not auto-start USB ETW traces**, because enabling an ETW session changes live system tracing state and writes an ETL recording, contrary to strict read-only operation. Analysis of USB reports requires an external, explicitly user-authorized capture or hardware analyzer.
+
+## Native Vulkan Game-style Reaction and Mouse Scene
+
+Click **Open Vulkan Scene** in the main program. It launches a temporary, independent copy of the executable using `--vulkan-scene`, so registering mouse Raw Input for the Vulkan window does not steal registration from the main diagnostic application. The scene renders with **native Vulkan through ash**, not DirectX, OpenGL, GDI, or an embedded browser.
+
+- Native Win32 window and fullscreen-style GPU-rendered color scene with a centered target.
+- Press **R** for reaction test, **SPACE** to arm, wait for the **green target/background**, then left-click. Early clicks count as false starts. The estimated reaction time starts just after the green frame's Vulkan `queue_present` submission; actual photon emission/scan-out is **not measured**.
+- Press **M** for the mouse motion scene: **cyan** shows raw-count integration, **orange** the sampled Windows cursor, and a central target supplies spatial reference. These two markers use different units/acceleration behavior.
+- Press **F1**=60 FPS, **F2**=120, **F3**=144, **F4**=240, **F5**=360, **F6**=500, **F7**=1000, **F8**=uncapped, **ESC**=close. Current FPS and approximate mouse movement-event frequency are shown in the window title.
+- Uses `VK_PRESENT_MODE_IMMEDIATE_KHR` **only** (no silent V-sync fallback), one CPU/GPU frame in flight and no shader compilation in the hot path. Vulkan still requires **at least two swapchain images**; Windows composition, driver queueing, and the monitor's scan-out timing cannot be forced to zero. Unsupported immediate presentation causes an explanatory error rather than silently enabling V-sync.
+
+This new scene is experimental and has not been validated with physical photodiode measurements. The standard Win32 reaction test remains available.
 
 ## Mode 3: Mouse Reaction Time
 

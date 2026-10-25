@@ -1,8 +1,9 @@
 [package]
 name = "mouse-keyboard-latency"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Windows Raw Input mouse click vs keyboard keypress timing tester"
+description = "Read-only Windows input diagnostics, native Vulkan reaction and mouse scene"
 license = "MIT"
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
+ash = { version = "0.38", default-features = true }
