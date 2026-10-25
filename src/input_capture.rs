@@ -124,7 +124,7 @@ unsafe extern "system" fn input_proc(hwnd:H,msg:u32,wp:usize,lp:isize)->isize{
                 let got=GetRawInputData(lp as H,RID_INPUT,
                     (&mut raw as *mut RawInput).cast(),&mut bytes,
                     size_of::<RawHeader>() as u32);
-                if got==u32::MAX||got as usize<size_of::<RawHeader>(){return;}
+                if got==u32::MAX||(got as usize)<size_of::<RawHeader>(){return;}
                 let kind=match raw.header.kind{
                     0 if got as usize>=size_of::<RawHeader>()+size_of::<RawMouse>()=>{
                         let m=raw.data.mouse;
