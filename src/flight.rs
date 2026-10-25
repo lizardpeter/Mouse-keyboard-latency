@@ -38,7 +38,7 @@ impl FlightEvent {
     }
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum Reason{RepeatBurst,CharacterBurst,QueueAge,GuiGap,InputGap,SlowRepeat,ClickMarker,Manual}
+pub enum Reason{RepeatBurst,CharacterBurst,QueueAge,GuiGap,InputGap,SlowRepeat,ClickMarker,SchedulerGap,Manual}
 impl Reason{
     pub fn label(self)->&'static str {
         match self{
@@ -49,6 +49,7 @@ impl Reason{
             Self::InputGap=>"Raw Input receiver heartbeat stall",
             Self::SlowRepeat=>"Slow held-key repeat delivery",
             Self::ClickMarker=>"Mouse click while Raw Input shows key held",
+            Self::SchedulerGap=>"Independent scheduler probe woke late",
             Self::Manual=>"Manual capture"
         }
     }
@@ -136,6 +137,9 @@ impl FlightRecorder {
         self.deadline=tick.saturating_add(self.ticks(POST_MS));
         self.width_ms=PRE_MS+POST_MS;self.pan_ms=0.0;
     }
+    pub fn external_incident(&mut self,tick:i64,reason:Reason,detail_ms:f64){
+        self.signal(tick,reason,detail_ms);
+    }
     pub fn manual_capture(&mut self,tick:i64){
         self.signal(tick,Reason::Manual,0.0);
     }
@@ -192,7 +196,11 @@ impl FlightRecorder {
             Lane::Watchdog=>{
                 if event.value>=200{
                     self.watchdog_gaps+=1;
-                    let reason=if event.tag=="CAPTURE_STALL"{Reason::InputGap}else{Reason::GuiGap};
+                    let reason=match event.tag{
+                        "CAPTURE_STALL"=>Reason::InputGap,
+                        "SCHEDULER_WAKE_GAP"=>Reason::SchedulerGap,
+                        _=>Reason::GuiGap,
+                    };
                     self.signal(event.tick,reason,event.value as f64);
                 }
             },
