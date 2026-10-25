@@ -300,8 +300,8 @@ impl Renderer{
         let bg=match mode{
             SceneMode::Mouse=>[0.025,0.035,0.065,1.0],
             SceneMode::Reaction=>match phase{
-                ReactionPhase::Waiting{..}|ReactionPhase::Pending=>[0.45,0.13,0.13,1.0],
-                ReactionPhase::Visible{..}=>[0.03,0.68,0.22,1.0],
+                ReactionPhase::Waiting{..}=>[0.45,0.13,0.13,1.0],
+                ReactionPhase::Pending|ReactionPhase::Visible{..}=>[0.03,0.68,0.22,1.0],
                 ReactionPhase::FalseStart=>[0.60,0.30,0.03,1.0],
                 _=>[0.05,0.09,0.15,1.0]
             }
@@ -336,7 +336,7 @@ impl Renderer{
             }
         } else {
             let w=self.extent.width as i32;let h=self.extent.height as i32;
-            let size=if matches!(phase,ReactionPhase::Visible{..}){120}else{52};
+            let size=if matches!(phase,ReactionPhase::Pending|ReactionPhase::Visible{..}){120}else{52};
             let attachments=[vk::ClearAttachment{
                 aspect_mask:vk::ImageAspectFlags::COLOR,color_attachment:0,
                 clear_value:vk::ClearValue{color:vk::ClearColorValue{
