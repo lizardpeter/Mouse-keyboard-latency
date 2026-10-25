@@ -42,7 +42,8 @@ impl MouseDiagnostics {
     }
     pub fn frequency_stats(&self)->Option<(f64,f64,f64)> {
         if self.interval_ms.is_empty(){return None;}
-        let mut values=self.interval_ms.clone();
+        let start=self.interval_ms.len().saturating_sub(2048);
+        let mut values=self.interval_ms[start..].to_vec();
         values.sort_by(|a,b|a.total_cmp(b));
         let median=values[values.len()/2];
         let p95=values[((values.len()-1) as f64*0.95).round() as usize];
