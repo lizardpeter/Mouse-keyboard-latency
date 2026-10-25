@@ -170,9 +170,10 @@ impl FlightRecorder {
             self.signal(event.tick,Reason::QueueAge,event.queue_ms as f64);
         }
     }
-    fn view_events(&self)->&[FlightEvent]{
-        if self.recording||self.completed{self.frozen.as_slice()}
-        else{self.rolling.as_slices().0} // render() below handles wrap using rolling iterator.
+    pub fn view_bounds_ms(&self,now:i64)->(f64,f64){
+        let end=self.current_end(now);
+        let start=end.saturating_sub(self.ticks(self.width_ms));
+        (self.ms(start),self.ms(end))
     }
     pub fn current_end(&self,now:i64)->i64{
         let latest=if self.recording||self.completed{
