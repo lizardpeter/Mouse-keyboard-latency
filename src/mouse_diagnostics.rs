@@ -68,6 +68,18 @@ impl MouseDiagnostics {
         if lines.is_empty(){"No mouse events yet. Move the mouse.".into()}
         else{lines.join("\r\n")}
     }
+    pub fn save_csv(&self,path:&std::path::Path)->std::io::Result<()>{
+        use std::io::Write;
+        let mut out=std::io::BufWriter::new(std::fs::File::create(path)?);
+        writeln!(out,"time_ms,device_handle,raw_dx,raw_dy,cursor_x,cursor_y,absolute,button_flags,motion_interval_ms")?;
+        for s in &self.samples{
+            let ms=s.time.saturating_sub(self.epoch) as f64*1000.0/self.frequency as f64;
+            writeln!(out,"{ms:.3},0x{:x},{},{},{},{},{},0x{:x},{}",
+                s.device,s.dx,s.dy,s.cursor_x,s.cursor_y,s.absolute,s.buttons,
+                s.interval_ms.map_or_else(String::new,|v|format!("{v:.4}")))?;
+        }
+        out.flush()
+    }
     pub fn append_report(&self,out:&mut String){
         let _=writeln!(out,"\n\nMOUSE RAW INPUT vs SAMPLED WINDOWS CURSOR");
         let _=writeln!(out,"Rate is an observed moving-event estimate, NOT a certified hardware polling rate.");
