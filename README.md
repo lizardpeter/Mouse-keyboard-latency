@@ -11,6 +11,23 @@ A native **Windows x64 GUI** built in Rust, with six interactive diagnostic mode
 
 The Windows build runs automatically when code is pushed to `main`. It produces a normal desktop GUI `.exe`, not a console program. No driver installation, Rust installation, or Vulkan SDK is required. The optional Vulkan scene dynamically loads the Vulkan runtime provided by the installed graphics driver; if unavailable, the original Win32 diagnostics still run.
 
+## Isolated Raw Input Thread and 60-Second Startup Analysis
+
+**New architecture:** Windows Raw Input mouse and keyboard messages are received on their own dedicated message-only Win32 window and thread, **separate from the GUI message queue**. The receiver timestamps each `WM_INPUT` at the beginning of its callback with QPC and copies only fixed-size event data to a **bounded nonblocking in-memory channel**. The GUI processes that channel in bounded batches. If the GUI is blocked by work or OS scheduling, the capture thread can continue receiving and time-stamping input independently. This does **not** guarantee input cannot be delayed upstream of that thread.
+
+Two independent normal-priority watchdogs monitor timestamp heartbeats: one on the GUI message loop, and another on the Raw Input receiver (including a 20ms process-local window timer when the mouse/keyboard is idle). Neither modifies timer resolution nor thread priorities. The program also records:
+- **Capture-message age:** coarse Windows `GetMessageTime` age measured on the actual Raw Input thread.
+- **Capture-to-GUI handoff:** elapsed time between the capture QPC timestamp and GUI processing it; normal handoff can be tens of milliseconds because the display/analysis loop is timer-driven at 20 Hz.
+- **Maximum capture callback cost / GUI handler cost:** timing spent in each receiver callback versus GUI WndProc invocation.
+- **Logical processor group and number:** the processor observed when each Raw Input callback runs, and periodically for the GUI. A thread may migrate, so a processor observation **does not prove processor affinity**.
+- **First 60 seconds after this program starts**, aggregated into 60 one-second bins, plus a bounded rolling history of the latest 60 seconds. This is **application launch time, not Windows boot time**. For the boot issue, start the program promptly after signing in and capture before the problem ends.
+
+The **6. Flight** tab now displays a one-line comparison of input/GUI watchdog stalls, maximum GUI handoff delay, and the last observed processor group/core for each thread. **Save Diagnostic Report** from Keyboard/Typing/Mouse or **Save Flight Report** adds the detailed `ISOLATED INPUT CAPTURE / GUI SCHEDULING DIAGNOSTICS` section with 60-second bins and event samples.
+
+Interpretation: If the input watchdog remains healthy and captures normal events while the GUI watchdog stalls, that implicates GUI/scheduling work rather than *capture-thread* delivery. If both stall, the cause may be shared scheduling, an upstream driver, or a common dependency; this alone cannot identify USB controller/DPC causation. Normal Raw Input while Notepad also stalls is a valuable cross-application comparison. Queue sizes and drops are explicitly reported so overload cannot quietly masquerade as valid timing.
+
+**Read-only guarantee:** No ETW sessions, service changes, power-plan or USB setting changes, driver or registry edits, global hooks, timers' resolution changes, realtime priority, pinned CPU affinity, or output files unless the user explicitly saves a report or CSV. Device registration and window timers are **process-local, transient**. These are diagnostic observations, not modifications to keyboard/mouse operation.
+
 ## Mode 6: Flight Recorder — anomaly capture and timeline
 
 **The new flight recorder is strictly passive and in-memory.** It keeps the most recent **10 seconds** of input events while the application is recording in **Keyboard (2)**, **Typing (4)**, or **Mouse (5)**. It automatically marks and snapshots a time window when it sees one of:
@@ -18,7 +35,7 @@ The Windows build runs automatically when code is pushed to `main`. It produces 
 - **Raw repeat burst:** four repeat keydown events for the same key/device with three successive gaps under 5 ms. Normal 33 ms typematic repeats should not trigger this.
 - **Character burst:** at least three `WM_CHAR` events with two consecutive inter-character gaps under 5 ms in the test box.
 - **Approximate queue-age alert:** at least 48 ms apparent Raw Input queue age (the Windows tick-based estimate is coarse).
-- **GUI heartbeat stall:** the application's own GUI-message callbacks stopped publishing a heartbeat for at least 200 ms, as observed by a separate in-process watchdog thread.
+- **GUI/input heartbeat stall:** either the GUI message loop or the independent Raw Input receiver stopped publishing a heartbeat for at least 200 ms, as observed by separate watchdog threads.
 
 The recorder copies up to 10 seconds **before** the trigger and collects up to **5 seconds after** it. Press the global **Mark Now** button while in an active diagnostic mode to create a manual snapshot even if no automatic anomaly is detected. Remain in that mode for five seconds after marking to collect the full post-trigger portion, then select **6. Flight** to inspect.
 
@@ -28,7 +45,7 @@ Select **Save Flight Report** or **Export CSV** to write the explicitly chosen f
 
 **Recording privacy:** Raw Input can be delivered to this process while it is not focused when one of the diagnostic modes is selected. Use **test keys only**, never passwords or private chat messages during keyboard/typing sessions. The Flight Recorder saves key identifiers and device handles, *not typed WM_CHAR text*, but those identifiers may still reveal typing. Review exported files before sharing.
 
-**Watchdog limitations:** The watchdog uses a 10 ms sleep in a normal user-mode thread and an atomic heartbeat; it does not set global timer resolution, load a driver, register hooks or create ETW sessions. A long gap indicates that the app's GUI callbacks were not observed promptly; it does **not** establish that USB delivery or the Windows kernel was stalled. An overloaded system may also delay the watchdog itself. The watchdog is enabled only while recording diagnostic modes and is suspended around the application's modal Save dialogs.
+**Watchdog limitations:** Each watchdog uses a 10 ms sleep in a normal user-mode thread and an atomic heartbeat; it does not set global timer resolution, load a driver, register hooks or create ETW sessions. A long gap indicates that the app's GUI callbacks were not observed promptly; it does **not** establish that USB delivery or the Windows kernel was stalled. An overloaded system may also delay the watchdog itself. The watchdog is enabled only while recording diagnostic modes and is suspended around the application's modal Save dialogs.
 
 ## Mode 1: Input Comparison
 
