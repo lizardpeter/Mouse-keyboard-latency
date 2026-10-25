@@ -11,6 +11,28 @@ A native **Windows x64 GUI** built in Rust, with six interactive diagnostic mode
 
 The Windows build runs automatically when code is pushed to `main`. It produces a normal desktop GUI `.exe`, not a console program. No driver installation, Rust installation, or Vulkan SDK is required. The optional Vulkan scene dynamically loads the Vulkan runtime provided by the installed graphics driver; if unavailable, the original Win32 diagnostics still run.
 
+## Live input incidents even hours after startup
+
+The program can now detect repeated incidents throughout one active Keyboard or Typing test, not just in the first minute after launch.
+
+- **Slow held-key repeats:** for each physical Raw Input device handle and scan code, exclude the initial Windows typematic delay, then flag consecutive observed repeat-keydown intervals of **150–2000 ms**. This directly targets the observed ~300 ms malfunction.
+- **Rapid repeat bursts:** detect runs of repeated downs within 5 ms that suggest delayed delivery; compare them with capture-message age and GUI-handoff time.
+- **Mouse motion gaps:** log gaps of 100–5000 ms between actual motion messages while the user is deliberately moving the mouse. **A pause in hand movement can produce the same result**; this alone does not establish USB interruption.
+- **Mouse click while key appears held:** after physically releasing a test key, **click the left mouse button immediately**. If the Raw Input key-release has not been processed by the independent receiver, the click is logged as an action marker. This is **not a physical release timestamp**, and cross-device ordering depends on Windows receiving/delivering the events.
+- **Third independent wakeup probe:** a normal-priority background sleeper measures intervals between its own 10ms wakeups and flags those exceeding 100ms. A late wakeup can be ordinary Windows scheduling noise and does not uniquely imply a USB fault, DPC/ISR stall, or specific driver.
+
+The **Flight recorder now retains the latest incident and up to five earlier incidents**, along with the latest 10-second rolling Raw Input history. Automatic captures rearm after an 8-second cooldown, and pressing **Mark Now** while recording creates a fresh incident even after an earlier one. The incident report exports all retained segments with timestamps; the on-screen six-track chart depicts the latest frozen segment. Each segment has bounded memory/event capacity. No automatic disk writes occur.
+
+**How to test an incident that occurs well after boot:**
+
+1. Launch the newest executable without restarting Windows; select **2. Keyboard** with recording active. Use only artificial test keys, no private text.
+2. Hold **D** long enough to produce several repeats, then *physically release D*. Immediately **click the mouse** to mark your action. Move the mouse continuously for a few seconds to provide another traffic channel. Try several short presses as well.
+3. If typing is visibly choppy, compare in **Notepad** while Input Timing Lab remains in Keyboard mode and records its background Raw Input. Do not interpret Notepad's contents as something our process can read.
+4. Press **Mark Now** while still recording if you can. Continue 5–10 seconds, then open **6. Flight**, and **Save Flight Report**. You can also save **2. Keyboard → Save Diagnostic Report** to include the full raw-key and new live-incident detail. Since selecting Flight stops capture, don't switch away during the incident.
+5. Share both text reports after reviewing the key-identifier history. Note whether mouse movement/clicks remained responsive and whether a physical key remained released while characters still appeared.
+
+**Interpretation:** If 300ms held-key repeat gaps occur in the independent receiver while the GUI-handoff delay is low, they are not caused simply by our GUI stalling. If the GUI-handoff delay jumps while receiver message ages remain low, the GUI is the bottleneck. If input- and GUI-thread heartbeats stall together and the unrelated sleeper also has late wakeups, broader scheduling interference becomes more plausible, but not proven. The app cannot observe a switch opening electrically; hardware instrumentation or an independently timed physical marker is needed to establish true release latency.
+
 ## Isolated Raw Input Thread and 60-Second Startup Analysis
 
 **New architecture:** Windows Raw Input mouse and keyboard messages are received on their own dedicated message-only Win32 window and thread, **separate from the GUI message queue**. The receiver timestamps each `WM_INPUT` at the beginning of its callback with QPC and copies only fixed-size event data to a **bounded nonblocking in-memory channel**. The GUI processes that channel in bounded batches. If the GUI is blocked by work or OS scheduling, the capture thread can continue receiving and time-stamping input independently. This does **not** guarantee input cannot be delayed upstream of that thread.
@@ -37,11 +59,11 @@ Interpretation: If the input watchdog remains healthy and captures normal events
 - **Approximate queue-age alert:** at least 48 ms apparent Raw Input queue age (the Windows tick-based estimate is coarse).
 - **GUI/input heartbeat stall:** either the GUI message loop or the independent Raw Input receiver stopped publishing a heartbeat for at least 200 ms, as observed by separate watchdog threads.
 
-The recorder copies up to 10 seconds **before** the trigger and collects up to **5 seconds after** it. Press the global **Mark Now** button while in an active diagnostic mode to create a manual snapshot even if no automatic anomaly is detected. Remain in that mode for five seconds after marking to collect the full post-trigger portion, then select **6. Flight** to inspect.
+For each incident the recorder copies up to 10 seconds **before** the trigger and collects up to **5 seconds after** it. Press the global **Mark Now** button while in an active diagnostic mode to create a manual snapshot even if no automatic anomaly is detected. Remain in that mode for five seconds after marking to collect the full post-trigger portion, then select **6. Flight** to inspect.
 
 The Flight screen includes a native Win32 **six-track density timeline**: Raw keyboard, Win32 key messages, characters, mouse reports, watchdog gaps, and anomaly markers. **Zoom + / Zoom -** change the visible span; **Older / Newer** pan through history. Each column represents a small time range; taller bars mean more events in that column. The UI never pretends that application-dispatch timestamps are physical USB report or switch timestamps.
 
-Select **Save Flight Report** or **Export CSV** to write the explicitly chosen file. Without that action, captures remain only in memory. **Reset mode** on Flight discards the current buffered recording; switching diagnostic modes does not silently transfer keyboard history into ordinary comparison/reaction modes. If you switch to Flight before post-roll completes, it freezes early and cannot recover the remaining post-event time.
+Select **Save Flight Report** or **Export CSV** to write the explicitly chosen file. Without that action, captures remain only in memory. **Reset mode** on Flight discards all retained incident snapshots; switching diagnostic modes does not silently transfer keyboard history into ordinary comparison/reaction modes. If you switch to Flight before post-roll completes, it freezes early and cannot recover the remaining post-event time.
 
 **Recording privacy:** Raw Input can be delivered to this process while it is not focused when one of the diagnostic modes is selected. Use **test keys only**, never passwords or private chat messages during keyboard/typing sessions. The Flight Recorder saves key identifiers and device handles, *not typed WM_CHAR text*, but those identifiers may still reveal typing. Review exported files before sharing.
 
