@@ -734,6 +734,7 @@ fn toggle(){
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.active=!app.active;
+            if !app.active{app.flight.finish_early();}
             app.note=if app.active{
                 "Recording: press LEFT CLICK + SPACE, releasing both before repeating.".into()
             }else{"Paused. Click Start recording when ready.".into()};
@@ -790,6 +791,7 @@ fn save(hwnd:H){
         let Some(app)=state.as_mut() else {return (false,1,now())};
         let prior=app.active;
         app.active=false;
+        app.flight.finish_early();
         app.watchdog.set_active(false,now());
         app.session.break_pair();
         (prior,app.mode,now())
@@ -875,6 +877,7 @@ fn save_report(hwnd:H) {
         if app.mode!=2 && app.mode!=4 && app.mode!=5 && app.mode!=6{return (false,String::new());}
         let previous=app.active;
         app.active=false;
+        app.flight.finish_early();
         app.watchdog.set_active(false,now());
         let mut snapshot=if app.mode==6 {
             String::new()
