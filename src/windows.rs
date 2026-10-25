@@ -216,6 +216,7 @@ struct State {
     flight:FlightRecorder,flight_views:Option<FlightViews>,watchdog:Watchdog,
     capture_watchdog:Watchdog,capture:Option<InputCapture>,thread_metrics:ThreadMetrics,
     live_probe:LiveProbe,scheduler_probe:SchedulerProbe,
+    last_mouse_timeline_tick:i64,
 }
 thread_local! {
     static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
@@ -1222,7 +1223,14 @@ fn consume_captured(hwnd:H,app:&mut State,e:CapturedInput)->bool{
                 app.mouse_diag.observe(tick,e.device,dx,dy,
                     flags&1!=0,buttons,p.x,p.y);
             }
-            if app.mode==5 || (matches!(app.mode,2|4)&&buttons!=0) {
+            // Subsample motion at up to 40Hz for the Keyboard/Typing
+            // timeline; full Raw Input timing still feeds LiveProbe.
+            let sample_motion=matches!(app.mode,2|4)
+                && (dx!=0||dy!=0)
+                && (app.last_mouse_timeline_tick==0 ||
+                    tick.saturating_sub(app.last_mouse_timeline_tick)>=app.frequency/40);
+            if sample_motion {app.last_mouse_timeline_tick=tick;}
+            if app.mode==5 || (matches!(app.mode,2|4)&&(buttons!=0||sample_motion)) {
                 app.flight.observe(FlightEvent::new(tick,Lane::Mouse,
                     if buttons!=0{"BUTTON"}else{"MOVE"},0,e.device,
                     dx.saturating_abs().saturating_add(dy.saturating_abs()),age));
@@ -1445,6 +1453,7 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             thread_metrics:ThreadMetrics::new(frequency,now()),
             live_probe:LiveProbe::new(frequency,now()),
             scheduler_probe:SchedulerProbe::new(frequency,now),
+            last_mouse_timeline_tick:0,
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");
