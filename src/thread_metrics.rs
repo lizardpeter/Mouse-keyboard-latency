@@ -23,6 +23,7 @@ pub struct ThreadMetrics{
     pub first_minute:[SecondBin;60],
     pub first_minute_samples:u32,
     pub gui_stalls:u64,pub capture_stalls:u64,
+    pub scheduler_wake_gaps:u64,pub max_scheduler_wake_gap_ms:f64,
     pub last_gui_gap_ms:f64,pub last_capture_gap_ms:f64,
     pub max_gui_gap_ms:f64,pub max_capture_gap_ms:f64,
     pub max_gui_handoff_ms:f64,pub max_capture_handler_us:f64,
@@ -39,6 +40,7 @@ impl ThreadMetrics{
         Self{freq,epoch,first_minute:[SecondBin::default();60],
             first_minute_samples:0,
             gui_stalls:0,capture_stalls:0,
+            scheduler_wake_gaps:0,max_scheduler_wake_gap_ms:0.0,
             last_gui_gap_ms:0.0,last_capture_gap_ms:0.0,
             max_gui_gap_ms:0.0,max_capture_gap_ms:0.0,
             max_gui_handoff_ms:0.0,max_capture_handler_us:0.0,
@@ -104,12 +106,17 @@ impl ThreadMetrics{
             if capture{b.capture_stalls+=1;}else{b.gui_stalls+=1;}
         }
     }
+    pub fn scheduler_wake_gap(&mut self,ms:f64){
+        self.scheduler_wake_gaps+=1;
+        self.max_scheduler_wake_gap_ms=self.max_scheduler_wake_gap_ms.max(ms);
+    }
     pub fn short_status(&self,dropped:u64)->String{
         let cpu=|p:Option<(u16,u8)>|p.map_or_else(||"?".into(),
             |(g,n)|format!("{g}:{n}"));
-        format!("Input CPU {}  GUI CPU {}  |  input stalls {}  GUI stalls {}  |                  GUI handoff max {:.1}ms  |  dropped {}",
+        format!("Input CPU {} | GUI CPU {} | input stalls {} | GUI stalls {} | sleeper wake gaps {} | handoff max {:.1}ms | overflow {}",
             cpu(self.latest_capture_cpu),cpu(self.latest_gui_cpu),
-            self.capture_stalls,self.gui_stalls,self.max_gui_handoff_ms,dropped)
+            self.capture_stalls,self.gui_stalls,self.scheduler_wake_gaps,
+            self.max_gui_handoff_ms,dropped)
     }
     pub fn status(&self,dropped:u64)->String{
         let cpu=|p:Option<(u16,u8)>|p.map_or_else(||"unknown".into(),
@@ -118,11 +125,13 @@ impl ThreadMetrics{
             "Raw Input receiver: {} events (keyboard {}, mouse {}); {} overflow-dropped\n\
              Capture callback max {:.3} ms | GUI handoff max {:.3} ms | GUI handler max {:.3} ms\n\
              GUI stalls {} (max {:.1}ms), independent input stalls {} (max {:.1}ms)\n\
+             Scheduler probe late wakeups: {} (worst {:.1}ms)\n\
              Last capture processor: {}; GUI processor: {}",
             self.raw_received,self.raw_keyboard,self.raw_mouse,dropped,
             self.max_capture_handler_us/1000.0,self.max_gui_handoff_ms,
             self.max_gui_handler_ms,
             self.gui_stalls,self.max_gui_gap_ms,self.capture_stalls,self.max_capture_gap_ms,
+            self.scheduler_wake_gaps,self.max_scheduler_wake_gap_ms,
             cpu(self.latest_capture_cpu),cpu(self.latest_gui_cpu))
     }
     pub fn append_report(&self,out:&mut String,dropped:u64){

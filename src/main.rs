@@ -9,6 +9,8 @@ mod mouse_diagnostics;
 mod polling;
 mod flight;
 mod thread_metrics;
+mod live_probe;
+#[cfg(windows)]mod scheduler_probe;
 #[cfg(windows)]mod input_capture;
 #[cfg(windows)]mod watchdog;
 #[cfg(windows)]mod hid_poll;

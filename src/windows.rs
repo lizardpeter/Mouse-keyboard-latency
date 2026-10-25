@@ -8,10 +8,12 @@ use crate::typing::TypingMonitor;
 use crate::deep_trace::{DeepTrace,TraceEvent};
 use crate::mouse_diagnostics::MouseDiagnostics;
 use crate::polling::PollingMonitor;
-use crate::flight::{FlightRecorder,FlightEvent,Lane,LANES};
+use crate::flight::{FlightRecorder,FlightEvent,Lane,Reason,LANES};
 use crate::watchdog::Watchdog;
 use crate::input_capture::{InputCapture,CapturedInput,Kind as CapturedKind,MAX_DRAIN_PER_PULSE,current_processor};
 use crate::thread_metrics::{ThreadMetrics,TimingSample};
+use crate::live_probe::{LiveProbe,IncidentKind};
+use crate::scheduler_probe::SchedulerProbe;
 use crate::hid_poll::get_hid_polled_interval_ms;
 use std::fmt::Write as _;
 use std::cell::Cell;
@@ -213,6 +215,8 @@ struct State {
     polling:PollingMonitor,
     flight:FlightRecorder,flight_views:Option<FlightViews>,watchdog:Watchdog,
     capture_watchdog:Watchdog,capture:Option<InputCapture>,thread_metrics:ThreadMetrics,
+    live_probe:LiveProbe,scheduler_probe:SchedulerProbe,
+    last_mouse_timeline_tick:i64,
 }
 thread_local! {
     static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
@@ -234,6 +238,7 @@ fn sync_capture(app:&mut State){
     let enabled=app.active && matches!(app.mode,2|4|5);
     app.watchdog.set_active(enabled,now());
     app.capture_watchdog.set_active(enabled,now());
+    app.scheduler_probe.set_active(enabled);
 }
 fn queue_bits()->u32 {
     // High word shows present queue bits. GetQueueStatus does not remove messages.
@@ -420,6 +425,7 @@ fn select_mode(hwnd:H,new_mode:usize){
         app.capture_watchdog.set_active(app.active && matches!(new_mode,2|4|5),now());
         if app.mode!=new_mode && (app.mode==2 || app.mode==4 || new_mode==2 || new_mode==4) {
             app.keyboard.suspend();
+            app.live_probe.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
         }
@@ -556,7 +562,7 @@ fn flight_action(hwnd:H,id:usize){
                     if app.active && matches!(app.mode,2|4|5|6){
                         app.flight.manual_capture(now());
                         if app.mode==6{app.flight.finish_early();}
-                        app.note="Manual flight marker recorded in memory. Keep diagnostic test running for 5s, then open Flight tab.".into();
+                        app.note="Manual incident marker saved in memory. Continue for 5 seconds. New incidents no longer overwrite the first capture.".into();
                     }else{app.note="Select Keyboard, Typing, or Mouse to start a diagnostic capture.".into();}
                 },
                 ID_FLIGHT_ZOOM_IN=>app.flight.zoom(true),
@@ -687,7 +693,9 @@ fn refresh() {
                 set_text(v.status,&app.flight.summary());
                 let dropped=app.capture.as_ref().map_or(0,InputCapture::dropped);
                 set_text(v.threads,&app.thread_metrics.short_status(dropped));
-                set_text(v.markers,&app.flight.marker_list());
+                set_text(v.markers,&format!(
+                    "LIVE INCIDENT COUNTERS\r\n{}\r\n{}",
+                    app.live_probe.short_status(),app.flight.marker_list()));
                 let (start,end)=app.flight.view_bounds_ms(timestamp);
                 set_text(v.window,&format!(
                     "View {:.3}–{:.3}s | span {:.2}s | pan {:.2}s",
@@ -709,7 +717,9 @@ fn refresh() {
                 "Down: {}     Up: {}     Auto-repeats: {}     Unmatched key-ups: {}     Max held together: {}",
                 kd.downs,kd.ups,kd.repeats,kd.orphan_ups,kd.maximum_simultaneous));
             set_text(k.held,&kd.held_display(timestamp));
-            set_text(k.alerts,&kd.alert_display(timestamp));
+            set_text(k.alerts,&format!(
+                "{}\r\n{}",
+                kd.alert_display(timestamp),app.live_probe.short_status()));
             set_text(k.durations,&format!(
                 "Currently held: {}  |  Last down→up: {}  |  Longest: {:.1} ms  |  Shortest event gap: {}",
                 kd.held_count(),
@@ -765,6 +775,7 @@ fn toggle(){
             app.flight.clear_temporal_state();
             app.session.break_pair();
             app.keyboard.suspend();
+            app.live_probe.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.active=!app.active;
@@ -781,6 +792,7 @@ fn reset(){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             if matches!(app.mode,2|4|5|6){
+                app.live_probe=LiveProbe::new(app.frequency,now());
                 app.flight=FlightRecorder::new(app.frequency,now());
                 app.watchdog.drain();
                 sync_capture(app);
@@ -883,6 +895,7 @@ fn save(hwnd:H){
             // A key released while the modal dialog had focus must not
             // appear stuck after returning to the diagnostics screen.
             app.keyboard.suspend();
+            app.live_probe.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.session.break_pair();
@@ -939,6 +952,7 @@ fn save_report(hwnd:H) {
         }
         app.thread_metrics.append_report(&mut snapshot,
             app.capture.as_ref().map_or(0,InputCapture::dropped));
+        app.live_probe.append_report(&mut snapshot);
         (previous,snapshot)
     });
     if contents.is_empty(){return;}
@@ -975,6 +989,7 @@ fn save_report(hwnd:H) {
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             app.keyboard.suspend();
+            app.live_probe.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.session.break_pair();
@@ -1132,7 +1147,7 @@ unsafe fn make_gui(hwnd:H){
         32,905,870,25,f_small);
     CREATE_GROUP.with(|g|g.set(6));
     text(hwnd,instance,"ANOMALY FLIGHT RECORDER",32,230,870,35,f_title);
-    text(hwnd,instance,"Capture is memory-only. Start on Keyboard, Typing or Mouse; switch here to inspect.",
+    text(hwnd,instance,"Captures recur automatically, keeping up to six episodes. Start in Keyboard, Typing or Mouse.",
         32,271,640,25,f_small);
     control(hwnd,instance,"BUTTON","Save Flight Report",ID_DIAGNOSTIC_REPORT,
         685,264,218,41,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
@@ -1150,7 +1165,7 @@ unsafe fn make_gui(hwnd:H){
     text(hwnd,instance,"CAPTURE MARKERS / AUTOMATIC DETECTIONS",32,794,865,24,f_medium);
     let flight_markers=control(hwnd,instance,"EDIT","",0,
         32,822,870,80,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
-    text(hwnd,instance,"Bars are host-delivery timestamps, not USB packet timestamps. Save only after reviewing key identifiers.",
+    text(hwnd,instance,"Mouse gaps may be hand pauses. Click-after-release is an action marker, not physical switch proof.",
         32,908,870,23,f_small);
 
     CREATE_GROUP.with(|g|g.set(0));
@@ -1195,12 +1210,27 @@ fn consume_captured(hwnd:H,app:&mut State,e:CapturedInput)->bool{
         CapturedKind::Mouse{flags,buttons,dx,dy,cursor_x,cursor_y}=>{
             let mut p=Point{x:cursor_x,y:cursor_y};
             unsafe{ScreenToClient(hwnd,&mut p);}
+            if matches!(app.mode,2|4){
+                let incident=app.live_probe.mouse(tick,e.device,dx,dy,
+                    buttons&RI_MOUSE_LEFT_BUTTON_DOWN!=0,
+                    age,elapsed,e.cpu.group,e.cpu.number);
+                if incident==Some(IncidentKind::ClickWhileHeld){
+                    app.flight.external_incident(tick,Reason::ClickMarker,0.0);
+                }
+            }
             if app.mode==5{
                 app.polling.mouse(e.device,tick,dx,dy,buttons);
                 app.mouse_diag.observe(tick,e.device,dx,dy,
                     flags&1!=0,buttons,p.x,p.y);
             }
-            if app.mode==5 || (matches!(app.mode,2|4)&&buttons!=0) {
+            // Subsample motion at up to 40Hz for the Keyboard/Typing
+            // timeline; full Raw Input timing still feeds LiveProbe.
+            let sample_motion=matches!(app.mode,2|4)
+                && (dx!=0||dy!=0)
+                && (app.last_mouse_timeline_tick==0 ||
+                    tick.saturating_sub(app.last_mouse_timeline_tick)>=app.frequency/40);
+            if sample_motion {app.last_mouse_timeline_tick=tick;}
+            if app.mode==5 || (matches!(app.mode,2|4)&&(buttons!=0||sample_motion)) {
                 app.flight.observe(FlightEvent::new(tick,Lane::Mouse,
                     if buttons!=0{"BUTTON"}else{"MOVE"},0,e.device,
                     dx.saturating_abs().saturating_add(dy.saturating_abs()),age));
@@ -1235,6 +1265,12 @@ fn consume_captured(hwnd:H,app:&mut State,e:CapturedInput)->bool{
             if app.mode==1 && vk==VK_SPACE {
                 app.session.space_key(down,tick);
             }else if matches!(app.mode,2|4){
+                let incident=app.live_probe.key(tick,e.device,vk,scan,flags,
+                    age,elapsed,e.cpu.group,e.cpu.number);
+                if incident==Some(IncidentKind::SlowRepeat){
+                    app.flight.external_incident(tick,Reason::SlowRepeat,
+                        app.live_probe.worst_repeat_ms);
+                }
                 let sc=if scan==0{vk}else{scan};
                 let id=KeyId::new(sc,flags);
                 let repeat=down && app.keyboard.observed_vk_states()
@@ -1360,6 +1396,14 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                             gap.duration_ms.round() as i32,0));
                     }
                 }
+                for late in app.scheduler_probe.drain(){
+                    if matches!(app.mode,2|4|5){
+                        app.thread_metrics.scheduler_wake_gap(late.elapsed_ms);
+                        app.flight.observe(FlightEvent::new(late.tick,
+                            Lane::Watchdog,"SCHEDULER_WAKE_GAP",0,0,
+                            late.elapsed_ms.round() as i32,0));
+                    }
+                }
                 if app.mode==2 || app.mode==4 {
                     let when=now();
                     for (vk,label,raw_down) in app.keyboard.observed_vk_states(){
@@ -1407,6 +1451,9 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             watchdog:Watchdog::new(frequency,now),
             capture_watchdog:Watchdog::new(frequency,now),capture:None,
             thread_metrics:ThreadMetrics::new(frequency,now()),
+            live_probe:LiveProbe::new(frequency,now()),
+            scheduler_probe:SchedulerProbe::new(frequency,now),
+            last_mouse_timeline_tick:0,
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");
