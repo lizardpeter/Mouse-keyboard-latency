@@ -620,13 +620,16 @@ fn refresh() {
         let Some(app)=state.as_ref() else{return;};
         let Some(l)=app.labels.as_ref() else{return;};
         let timestamp = now();
+        set_text(l.start,if app.active {"Pause"} else {"Start recording"});
+        set_text(l.recording,if app.active {"●  RECORDING  ·  Input is being captured"}
+            else {"●  PAUSED  ·  Press Start recording"});
+        // Hidden Win32 controls should never incur periodic formatting,
+        // SetWindowText or layout work during sensitive high-frequency input.
+        if app.mode==1{
         show_device(app.session.device_snapshot(Kind::Mouse, timestamp),
             l.mouse_count,l.mouse_last,l.mouse_age,l.mouse_interval,"clicks");
         show_device(app.session.device_snapshot(Kind::Keyboard, timestamp),
             l.key_count,l.key_last,l.key_age,l.key_interval,"key presses");
-        set_text(l.start,if app.active {"Pause"} else {"Start recording"});
-        set_text(l.recording,if app.active {"●  RECORDING  ·  Input is being captured"}
-            else {"●  PAUSED  ·  Press Start recording"});
         set_text(l.count,&app.session.trial_count().to_string());
         let s=app.session.stats();
         set_text(l.mouse,&s.as_ref().map_or(0,|s|s.mouse_first).to_string());
@@ -665,6 +668,8 @@ fn refresh() {
         }
         set_text(l.recent,&lines);
         set_text(l.notification,&app.note);
+        }
+        if app.mode==4 {
         if let Some(view)=app.typing_views.as_ref() {
             set_text(view.stats,&app.typing.stats());
             set_text(view.last_gap,&format!(
@@ -675,6 +680,7 @@ fn refresh() {
             ));
             set_text(view.text_log,&app.typing.recent("WM_CHAR",11));
             set_text(view.raw_log,&app.typing.recent("RAW_INPUT",11));
+        }
         }
         if let Some(v)=app.flight_views.as_ref(){
             if app.mode==6 {
@@ -696,6 +702,7 @@ fn refresh() {
                 set_text(v.deep,&format!("{}\r\nRaw cursor comparison and full per-device data are included in saved report.",app.trace.summary()));
             }
         }
+        if app.mode==2 {
         if let Some(k)=app.key_views.as_ref(){
             let kd=&app.keyboard;
             set_text(k.counters,&format!(
@@ -719,6 +726,8 @@ fn refresh() {
             if app.mode==2 {set_text(k.polling,&app.polling.gui_keyboard(timestamp));}
             set_text(k.recent,&kd.log_display());
         }
+        }
+        if app.mode==3 {
         if let Some(r)=app.reaction_views.as_ref(){
             let rx=&app.reaction;
             let (status,caption)=match rx.phase {
@@ -745,6 +754,7 @@ fn refresh() {
                 .map(|(i,v)|format!("Trial {:>2}      {:.1} ms",i+1,v))
                 .collect::<Vec<_>>().join("\r\n");
             set_text(r.recent,&history);
+        }
         }
     });
 }
