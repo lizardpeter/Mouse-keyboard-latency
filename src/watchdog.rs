@@ -14,6 +14,12 @@ struct Shared{
     latest:AtomicI64,
     gaps:Mutex<VecDeque<GuiGap>>,
 }
+#[derive(Clone)]
+pub struct Heartbeat{shared:Arc<Shared>}
+impl Heartbeat{
+    pub fn beat(&self,tick:i64){self.shared.latest.store(tick,Ordering::Release);}
+    pub fn last(&self)->i64{self.shared.latest.load(Ordering::Acquire)}
+}
 pub struct Watchdog{
     shared:Arc<Shared>,
     join:Option<JoinHandle<()>>,
@@ -57,6 +63,8 @@ impl Watchdog{
         });
         Self{shared,join:Some(join)}
     }
+    pub fn heartbeat(&self)->Heartbeat{Heartbeat{shared:self.shared.clone()}}
+    pub fn last_beat(&self)->i64{self.shared.latest.load(Ordering::Acquire)}
     pub fn set_active(&self,enabled:bool,now:i64){
         self.shared.latest.store(now,Ordering::Release);
         self.shared.enabled.store(enabled,Ordering::Release);
