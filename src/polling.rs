@@ -180,14 +180,14 @@ impl PollingMonitor {
                 d.hid_polled_interval_ms.map_or("unavailable".into(),|ms|
                     format!("{ms} ms ({} Hz, NOT USB endpoint bInterval)",1000/ms)));
         }
-        out.push_str("Rates reflect host-delivered Raw Input. A resting mouse sends fewer motion reports.\n");
+        out.push_str("Host Raw Input events; USB endpoint bInterval not read. Resting mice yield fewer motion reports.\n");
         out
     }
     pub fn gui_keyboard(&self,now:i64)->String {
         if self.keyboards.is_empty(){return "No Raw Input keyboard devices observed yet.".into();}
         let mut out=String::new();
         for (&id,d) in &self.keyboards{
-            let _=writeln!(out,"Keyboard 0x{id:x}: {} key transitions, {} Windows repeats; {} total Raw messages",
+            let _=writeln!(out,"Keyboard 0x{id:x}: {} key transitions, {} repeated downs; {} total Raw messages",
                 d.transitions,d.key_repeats,d.packets);
             if let Some(rate)=d.packet_rates(now,self.frequency){
                 let _=writeln!(out,"  Message gaps: median {:.2} ms | P95 {:.2} ms | P99 {:.2} ms | min {:.3} ms",
