@@ -1162,7 +1162,86 @@ unsafe fn make_gui(hwnd:H){
     });
     select_mode(hwnd,1);
 }
+/// The GUI consumes bounded capture batches. The original QPC timestamps and
+/// queue ages were taken BEFORE this thread got CPU time; GUI handoff is
+/// measured independently and cannot change the actual Raw Input timestamps.
+fn consume_captured(hwnd:H,app:&mut State,e:CapturedInput)->bool{
+    if !app.active || app.mode==6{return false;}
+    let tick=e.tick;let age=e.queue_age_ms;let bits=e.queue_bits;
+    let elapsed=now().saturating_sub(tick) as f64*1000.0/app.frequency as f64;
+    let keyboard=matches!(e.kind,CapturedKind::Keyboard{..});
+    app.thread_metrics.raw(TimingSample{
+        tick,device:e.device,keyboard,
+        captured_age_ms:age,handoff_ms:elapsed,callback_us:e.callback_us,
+        group:e.cpu.group,processor:e.cpu.number,
+    });
+    if matches!(app.mode,2|4|5){app.trace.observe_dispatch(tick,bits);}
+    match e.kind{
+        CapturedKind::Mouse{flags,buttons,dx,dy,cursor_x,cursor_y}=>{
+            let mut p=Point{x:cursor_x,y:cursor_y};
+            unsafe{ScreenToClient(hwnd,&mut p);}
+            if app.mode==5{
+                app.polling.mouse(e.device,tick,dx,dy,buttons);
+                app.mouse_diag.observe(tick,e.device,dx,dy,
+                    flags&1!=0,buttons,p.x,p.y);
+            }
+            if app.mode==5 || (matches!(app.mode,2|4)&&buttons!=0) {
+                app.flight.observe(FlightEvent::new(tick,Lane::Mouse,
+                    if buttons!=0{"BUTTON"}else{"MOVE"},0,e.device,
+                    dx.saturating_abs().saturating_add(dy.saturating_abs()),age));
+                app.trace.record(TraceEvent::raw(tick,"RAW_MOUSE",0,0,
+                    age,bits,e.device,dx,dy,p.x,p.y,buttons,0));
+            }
+            if app.mode==1{
+                let over_toolbar=p.x>=0&&p.x<930&&p.y>=0&&p.y<215;
+                if buttons&RI_MOUSE_LEFT_BUTTON_UP!=0{
+                    app.session.mouse_button(false,tick);
+                }
+                if buttons&RI_MOUSE_LEFT_BUTTON_DOWN!=0&&!over_toolbar{
+                    app.session.mouse_button(true,tick);
+                }
+            } else if app.mode==3 && buttons&RI_MOUSE_LEFT_BUTTON_DOWN!=0 {
+                if p.x>=32&&p.x<915&&p.y>=315&&p.y<590{
+                    app.reaction.click(tick,app.frequency);
+                    return true;
+                }
+            }
+        },
+        CapturedKind::Keyboard{vk,scan,flags}=>{
+            if vk==0xff{return false;}
+            let down=flags&RI_KEY_BREAK==0;
+            if matches!(app.mode,2|4|5){
+                if matches!(app.mode,2|4){
+                    app.polling.keyboard(e.device,tick,vk,scan,down);
+                }
+                app.trace.record(TraceEvent::raw(tick,"RAW_KEY",
+                    vk,scan,age,bits,e.device,0,0,0,0,0,0));
+            }
+            if app.mode==1 && vk==VK_SPACE {
+                app.session.space_key(down,tick);
+            }else if matches!(app.mode,2|4){
+                let sc=if scan==0{vk}else{scan};
+                let id=KeyId::new(sc,flags);
+                let repeat=down && app.keyboard.observed_vk_states()
+                    .iter().any(|(key,_,held)|*key==vk&&*held);
+                let label=key_name(vk,sc,flags);
+                app.flight.observe(FlightEvent::new(tick,Lane::RawKey,
+                    if !down{"UP"}else if repeat{"REPEAT"}else{"DOWN"},
+                    vk,e.device,0,age));
+                app.keyboard.observe_queue_age(age);
+                if app.mode==4{
+                    app.typing.raw(&label,
+                        if !down{"UP"}else if repeat{"REPEAT"}else{"DOWN"},tick);
+                }
+                app.keyboard.event_vk(id,label,down,tick,vk);
+            }
+        }
+    }
+    false
+}
+
 unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
+    let _cost=HandlerCost(now());
     // A heartbeat is published on each GUI callback, not just WM_TIMER.
     // WM_TIMER is low priority when input is saturated.
     STATE.with(|cell|{
@@ -1175,118 +1254,9 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
     }
     match msg{
         WM_CREATE=>{make_gui(hwnd);return 0;}
-        WM_INPUT=>{
-            // Capture QPC as close to Raw Input dispatch as possible.
-            let tick=now();
-            let mut raw:RawInput=zeroed();
-            let mut size=size_of::<RawInput>() as u32;
-            let got=GetRawInputData(lp as H,RID_INPUT,
-                (&mut raw as *mut RawInput).cast(),&mut size,size_of::<RawHeader>() as u32);
-            let mut repaint=false;
-            if got!=u32::MAX {
-                STATE.with(|cell|{
-                    let mut state=cell.borrow_mut();
-                    let Some(app)=state.as_mut()else{return};
-                    if !app.active{return};
-                    let bits=queue_bits();
-                    let age=message_age();
-                    app.trace.observe_dispatch(tick,bits);
-                    if raw.header.kind==0{
-                        let mouse=raw.data.mouse;
-                        let mut p=Point::default();
-                        if GetCursorPos(&mut p)!=0{ScreenToClient(hwnd,&mut p);}
-                        if app.mode==5 {
-                            app.polling.mouse(raw.header.device as usize,tick,
-                                mouse.last_x,mouse.last_y,mouse.buttons as u16);
-                            app.mouse_diag.observe(tick,raw.header.device as usize,
-                                mouse.last_x,mouse.last_y,mouse.flags&1!=0,
-                                mouse.buttons as u16,p.x,p.y);
-                        }
-                        if app.mode==5 ||
-                            ((app.mode==2||app.mode==4) && mouse.buttons as u16!=0)
-                        {
-                            app.flight.observe(FlightEvent::new(tick,Lane::Mouse,
-                                if mouse.buttons as u16!=0{"BUTTON"}else{"MOVE"},
-                                0,raw.header.device as usize,
-                                mouse.last_x.saturating_abs().saturating_add(
-                                    mouse.last_y.saturating_abs()),age));
-                        }
-                        // In keyboard/typing tests preserve trace capacity for
-                        // keyboard events and intentional mouse-button markers.
-                        // High-Hz mouse movement can otherwise exhaust 100k rows quickly.
-                        if app.mode==5 || ((app.mode==2 || app.mode==4) && mouse.buttons as u16!=0) {
-                            app.trace.record(TraceEvent::raw(tick,"RAW_MOUSE",0,0,
-                                age,bits,raw.header.device as usize,
-                                mouse.last_x,mouse.last_y,p.x,p.y,mouse.buttons as u16,0));
-                        }
-                    } else if raw.header.kind==1 && (app.mode==2 || app.mode==4 || app.mode==5) {
-                        let k=raw.data.key;
-                        if app.mode==2||app.mode==4 {
-                            app.polling.keyboard(raw.header.device as usize,tick,
-                                k.key,k.make,k.flags&RI_KEY_BREAK==0);
-                        }
-                        app.trace.record(TraceEvent::raw(tick,"RAW_KEY",k.key,k.make,
-                            age,bits,raw.header.device as usize,0,0,0,0,0,first_pending_raw_size()));
-                    }
-                    match raw.header.kind {
-                        0 if got as usize>=size_of::<RawHeader>()+size_of::<RawMouse>()=>{
-                            let bits=raw.data.mouse.buttons as u16;
-                            if app.mode==1 {
-                                let mut p=Point::default();
-                                let over_toolbar=GetCursorPos(&mut p)!=0
-                                    && ScreenToClient(hwnd,&mut p)!=0
-                                    && p.x>=0&&p.x<930&&p.y>=0&&p.y<215;
-                                if bits&RI_MOUSE_LEFT_BUTTON_UP!=0{
-                                    app.session.mouse_button(false,tick);
-                                }
-                                if bits&RI_MOUSE_LEFT_BUTTON_DOWN!=0&&!over_toolbar{
-                                    app.session.mouse_button(true,tick);
-                                }
-                            } else if app.mode==3 && bits&RI_MOUSE_LEFT_BUTTON_DOWN!=0 {
-                                let mut p=Point::default();
-                                let on_color_panel=GetCursorPos(&mut p)!=0
-                                    && ScreenToClient(hwnd,&mut p)!=0
-                                    && p.x>=32&&p.x<915&&p.y>=315&&p.y<590;
-                                if on_color_panel {
-                                    app.reaction.click(tick,app.frequency);
-                                    repaint=true;
-                                }
-                            }
-                        }
-                        1 if got as usize>=size_of::<RawHeader>()+size_of::<RawKeyboard>()=>{
-                            let key=raw.data.key;
-                            if key.key==0xff{return;}
-                            let down=key.flags&RI_KEY_BREAK==0;
-                            if app.mode==1 && key.key==VK_SPACE {
-                                app.session.space_key(down,tick);
-                            } else if app.mode==2 || app.mode==4 {
-                                let scan=if key.make==0{key.key}else{key.make};
-                                let id=KeyId::new(scan,key.flags);
-                                let delay=age;
-                                let was_held=down && app.keyboard.observed_vk_states()
-                                    .iter().any(|(vk,_,held)|*vk==key.key && *held);
-                                app.flight.observe(FlightEvent::new(
-                                    tick,Lane::RawKey,
-                                    if !down{"UP"}else if was_held{"REPEAT"}else{"DOWN"},
-                                    key.key,raw.header.device as usize,0,delay));
-                                app.keyboard.observe_queue_age(delay);
-                                let label=key_name(key.key,scan,key.flags);
-                                if app.mode==4 {
-                                    let repeat=down && app.keyboard.observed_vk_states()
-                                        .iter().any(|(vk,_,held)|*vk==key.key && *held);
-                                    app.typing.raw(&label,
-                                        if !down{"UP"}else if repeat{"REPEAT"}else{"DOWN"},tick);
-                                }
-                                app.keyboard.event_vk(id,label,down,tick,key.key);
-                            }
-                        }
-                        _=>{}
-                    }
-                });
-            }
-            if repaint{InvalidateRect(hwnd,null(),0);}
-            return DefWindowProcW(hwnd,msg,wp,lp);
-        }
+        // WM_INPUT now belongs exclusively to the independent message-only
+        // capture window. This GUI thread never receives Raw Input directly.
+        WM_INPUT=>{return DefWindowProcW(hwnd,msg,wp,lp);}
         WM_COMMAND=>{
             let id=wp&0xFFFF;
             if id==ID_TYPING_INPUT || id==ID_TYPING_TEXTLOG || id==ID_TYPING_RAWLOG {
