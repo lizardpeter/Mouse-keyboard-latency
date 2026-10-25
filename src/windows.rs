@@ -951,27 +951,31 @@ unsafe fn make_gui(hwnd:H){
 
     CREATE_GROUP.with(|g|g.set(0));
     text(hwnd,instance,"INPUT TIMING LAB",30,16,860,45,f_title);
-    text(hwnd,instance,"Five passive input tests  •  Native Win32  •  Optional Vulkan scene",
+    text(hwnd,instance,"Six tests  •  Read-only input flight recorder  •  Vulkan game scene",
         32,62,860,24,f_small);
     control(hwnd,instance,"BUTTON","1. Compare",ID_MODE_COMPARE,
-        32,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        32,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","2. Keyboard",ID_MODE_KEYBOARD,
-        210,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        178,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","3. Reaction",ID_MODE_REACTION,
-        388,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        324,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","4. Typing",ID_MODE_TYPING,
-        566,102,166,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        470,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","5. Mouse",ID_MODE_MOUSE,
-        744,102,160,42,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        616,102,138,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","6. Flight",ID_MODE_FLIGHT,
+        762,102,142,42,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     let start=control(hwnd,instance,"BUTTON","Pause",ID_START,
-        31,163,155,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        31,163,110,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","Reset mode",ID_RESET,
-        205,163,135,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+        150,163,110,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     control(hwnd,instance,"BUTTON","Export CSV",ID_SAVE,
-        357,163,130,38,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
-    let recording=text(hwnd,instance,"",670,167,255,32,f_small);
+        268,163,109,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","Mark Now",ID_FLIGHT_MARK,
+        385,163,104,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    let recording=text(hwnd,instance,"",665,167,255,32,f_small);
     control(hwnd,instance,"BUTTON","Open Vulkan Scene",ID_VULKAN_SCENE,
-        497,163,161,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+        498,163,158,38,WS_TABSTOP|BS_PUSHBUTTON,f_small);
 
     CREATE_GROUP.with(|g|g.set(1));
     text(hwnd,instance,"LIVE MOUSE · LEFT CLICK",32,229,410,27,f_medium);
@@ -1083,9 +1087,32 @@ unsafe fn make_gui(hwnd:H){
     let mouse_deep=text(hwnd,instance,"",32,847,870,50,f_small);
     text(hwnd,instance,"Open Vulkan Scene, then M for live cyan raw-counts vs orange Windows pointer markers.",
         32,905,870,25,f_small);
+    CREATE_GROUP.with(|g|g.set(6));
+    text(hwnd,instance,"ANOMALY FLIGHT RECORDER",32,230,870,35,f_title);
+    text(hwnd,instance,"Capture is memory-only. Start on Keyboard, Typing or Mouse; switch here to inspect.",
+        32,271,640,25,f_small);
+    control(hwnd,instance,"BUTTON","Save Flight Report",ID_DIAGNOSTIC_REPORT,
+        685,264,218,41,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
+    let flight_status=text(hwnd,instance,"",32,310,860,25,f_small);
+    control(hwnd,instance,"BUTTON","Zoom +",ID_FLIGHT_ZOOM_IN,
+        32,337,104,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","Zoom -",ID_FLIGHT_ZOOM_OUT,
+        144,337,104,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","Older <<",ID_FLIGHT_BACK,
+        256,337,112,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    control(hwnd,instance,"BUTTON","Newer >>",ID_FLIGHT_FORWARD,
+        376,337,112,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
+    let flight_window=text(hwnd,instance,"",496,339,406,27,f_small);
+    text(hwnd,instance,"CAPTURE MARKERS / AUTOMATIC DETECTIONS",32,794,865,24,f_medium);
+    let flight_markers=control(hwnd,instance,"EDIT","",0,
+        32,822,870,80,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
+    text(hwnd,instance,"Bars are host-delivery timestamps, not USB packet timestamps. Save only after reviewing key identifiers.",
+        32,908,870,23,f_small);
+
     CREATE_GROUP.with(|g|g.set(0));
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
+            app.flight_views=Some(FlightViews{status:flight_status,markers:flight_markers,window:flight_window});
             app.labels=Some(Labels{
                 start,recording,
                 mouse_count,mouse_last,mouse_age,mouse_interval,
@@ -1242,6 +1269,9 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                 ID_MODE_TYPING=>select_mode(hwnd,4),
                 ID_REACTION_ARM=>arm_reaction(hwnd),
                 ID_MODE_MOUSE=>select_mode(hwnd,5),
+                ID_MODE_FLIGHT=>select_mode(hwnd,6),
+                ID_FLIGHT_MARK|ID_FLIGHT_ZOOM_IN|ID_FLIGHT_ZOOM_OUT|
+                    ID_FLIGHT_BACK|ID_FLIGHT_FORWARD=>flight_action(hwnd,id),
                 ID_QUERY_HID=>query_hid(),
                 ID_VULKAN_SCENE=>{
                     match std::env::current_exe().and_then(|exe|
