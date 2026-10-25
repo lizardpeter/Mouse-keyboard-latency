@@ -465,6 +465,84 @@ fn arm_reaction(hwnd:H){
     unsafe{InvalidateRect(hwnd,null(),1);}
     refresh();
 }
+fn draw_flight_chart(dc:H){
+    STATE.with(|cell|{
+        let state=cell.borrow();
+        let Some(app)=state.as_ref() else{return};
+        if app.mode!=6{return;}
+        let width=735usize;
+        let end=app.flight.current_end(now());
+        let histogram=app.flight.histogram(end,width);
+        let colors=[0x00b78516u32,0x00a65f76,0x00a53d16,
+            0x00a29030,0x00664bd3,0x00169add];
+        let brushes:Vec<H>=colors.iter().map(|c|unsafe{CreateSolidBrush(*c)}).collect();
+        let backdrop=unsafe{CreateSolidBrush(0x00f1eae3)};
+        let grid=unsafe{CreateSolidBrush(0x00dfd8d2)};
+        let tick=(app.flight.width_ms/1000.0)/6.0;
+        for lane in 0..LANES{
+            let y=395+(lane as i32)*61;
+            let bg=Rect{left:155,top:y,right:895,bottom:y+43};
+            unsafe{FillRect(dc,&bg,backdrop);}
+            let label=["RAW KEY","WIN32 KEY","WM_CHAR",
+                "MOUSE","GUI GAP","ANOMALY"][lane];
+            let mut name=Rect{left:33,top:y+8,right:150,bottom:y+41};
+            unsafe{
+                SetBkMode(dc,1);SetTextColor(dc,0x0043362e);
+                DrawTextW(dc,wide(label).as_ptr(),-1,&mut name,0);
+            }
+            for x in 0..=6{
+                let gx=155+((width*x)/6) as i32;
+                unsafe{FillRect(dc,&Rect{left:gx,top:y,right:gx+1,bottom:y+43},grid);}
+            }
+            for (col,row) in histogram.iter().enumerate(){
+                let count=row[lane];
+                if count==0{continue;}
+                let height=((count as i32)*4).clamp(4,40);
+                let gx=155+col as i32;
+                let bar=Rect{left:gx,top:y+42-height,right:gx+1,bottom:y+42};
+                unsafe{FillRect(dc,&bar,brushes[lane]);}
+            }
+        }
+        for i in 0..=6{
+            let x=155+(width*i/6) as i32;
+            let offset=(6-i) as f64*tick;
+            let mut rect=Rect{left:x.saturating_sub(24),top:765,right:x+42,bottom:786};
+            unsafe{
+                SetTextColor(dc,0x0043362e);
+                DrawTextW(dc,wide(&format!("-{offset:.2}s")).as_ptr(),-1,&mut rect,0);
+            }
+        }
+        let mut info=Rect{left:155,top:363,right:890,bottom:388};
+        unsafe{
+            DrawTextW(dc,wide("Left: older  /  Right: newer  |  bar height = events per pixel").as_ptr(),
+                -1,&mut info,0);
+            for b in brushes {DeleteObject(b);}
+            DeleteObject(backdrop);DeleteObject(grid);
+        }
+    });
+}
+fn flight_action(hwnd:H,id:usize){
+    STATE.with(|cell|{
+        if let Some(app)=cell.borrow_mut().as_mut(){
+            match id{
+                ID_FLIGHT_MARK=>{
+                    if app.active && matches!(app.mode,2|4|5|6){
+                        app.flight.manual_capture(now());
+                        if app.mode==6{app.flight.finish_early();}
+                        app.note="Manual flight marker recorded in memory. Keep diagnostic test running for 5s, then open Flight tab.".into();
+                    }else{app.note="Select Keyboard, Typing, or Mouse to start a diagnostic capture.".into();}
+                },
+                ID_FLIGHT_ZOOM_IN=>app.flight.zoom(true),
+                ID_FLIGHT_ZOOM_OUT=>app.flight.zoom(false),
+                ID_FLIGHT_BACK=>app.flight.pan(true),
+                ID_FLIGHT_FORWARD=>app.flight.pan(false),
+                _=>{},
+            }
+        }
+    });
+    unsafe{InvalidateRect(hwnd,null(),0);}
+    refresh();
+}
 fn paint_reaction(hwnd:H) {
     // Paint submission is our local timing reference; physical display scan-out
     // may occur later, so this is NOT photon-verified reaction time.
@@ -498,6 +576,7 @@ fn paint_reaction(hwnd:H) {
             DrawTextW(dc,wide(caption).as_ptr(),-1,&mut rect,0x21|0x4);
         }
     }
+    if mode==6{draw_flight_chart(dc);}
     unsafe{EndPaint(hwnd,&ps);}
     if mode==3 && phase==Phase::PendingPaint{
         STATE.with(|cell|{
