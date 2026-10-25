@@ -74,9 +74,23 @@ Important distinction: this tool *does not intercept Chrome/Notepad text output*
 
 For privacy, type **only artificial test sentences**, never passwords or sensitive material. This mode does not install any system-wide keyboard hooks, modify Windows settings, or send input records to a network service. The report and CSV are only created if you choose to save them.
 
+## Polling-rate analysis: what reviewers' tools actually measure
+
+This release takes inspiration from two public codebases: [microe1's MouseTester](https://github.com/microe1/MouseTester) (Win32 Raw Input and QPC) and [ClickSyncMouseTester](https://github.com/Nuitfanee/ClickSyncMouseTester) (Rust, per-device windows, and motion-vs-packet analysis). The implementation here is original.
+
+**Three values must never be confused:**
+
+1. **USB endpoint-advertised polling interval:** the `bInterval` from a USB interrupt-IN endpoint configuration descriptor, interpreted at the device's USB speed. This is the firmware-advertised service interval. **Input Timing Lab does not automatically retrieve it**, because Microsoft USBView's descriptor query walks host/hub IOCTLs, typically opening hub handles with write access; we deliberately refuse that under our strict zero-access policy. Read it independently using [Microsoft's USBView](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/usbview) if desired.
+2. **HID class polled-collection interval:** an optional Windows `IOCTL_HID_GET_POLL_FREQUENCY_MSEC` result. Clicking **Read HID interval (GET)** opens the device with `dwDesiredAccess=0` and submits **only** the documented GET command. An unsupported/denied request returns **unavailable**. A 1 ms result does not certify a USB endpoint polls at 1000 Hz, and the API's millisecond integer cannot accurately express 8000 Hz.
+3. **Host-delivered effective event rate:** per-device QPC timestamps from `WM_INPUT`. The mouse screen now displays independent estimates per `hDevice`: median-derived motion-event rate, actual last-1-second motion event count, median/P95/P99 motion intervals, and all-Raw-report spacing. Motion output depends on continuous physical movement and can differ from USB service intervals, particularly on high-report-rate mice.
+
+Keyboard repeats (**typematic** events) are explicitly counted separately from genuine down/up transitions. The keyboard view shows per-device key transitions, Windows repeat counts, and raw-message gap statistics. **No Windows user-mode Raw Input algorithm can recover a keyboard's 1000/8000 Hz USB polling rate merely by holding a key**; it receives changes and autorepeats, not every empty USB scan. Keyboard USB polling interval requires actual USB endpoint descriptors or external bus instrumentation.
+
+The optional HID metadata query never changes the polling configuration; there is **no SET IOCTL** in the app, no system-file or registry write, and no background scan. Measurements and device paths remain in memory; full device paths and serial numbers are not exported. Saved reports are created only after you explicitly choose a path.
+
 ## Mode 5: Mouse Polling / Raw vs Windows Pointer
 
-Move the mouse continuously while keeping **5. Mouse** selected. The app records Windows `WM_INPUT` movement events, their QPC inter-arrival intervals, raw X/Y counts, mouse-button flags, device handles and the Windows cursor coordinates sampled at dispatch. It displays the median-derived observed movement event frequency, median and P95 inter-arrival gaps, and a live event timeline. You can export the observations as CSV or save a report.
+Move the mouse continuously while keeping **5. Mouse** selected. The app records Windows `WM_INPUT` movement events, their QPC inter-arrival intervals, raw X/Y counts, mouse-button flags, device handles and the Windows cursor coordinates sampled at dispatch. It displays **per-mouse** median-derived motion event rate, latest 1-second count, median/P95/P99 intervals, and a live event timeline. The HID GET-only metadata button is optional. You can export the observations as CSV or save a report.
 
 **This is not an absolute measurement of the mouse's USB polling rate.** Idle sensors send fewer movement reports, multiple devices can be present, high-frequency arrivals can be batched, and cursor coordinates are affected by pointer settings and DWM. Raw motion counts and cursor pixels cannot be subtracted to calculate input delay.
 

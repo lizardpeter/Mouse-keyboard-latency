@@ -6,6 +6,8 @@ mod reaction;
 mod typing;
 mod deep_trace;
 mod mouse_diagnostics;
+mod polling;
+#[cfg(windows)]mod hid_poll;
 #[cfg(windows)] mod vulkan_scene;
 #[cfg(windows)] mod windows;
 
