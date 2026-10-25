@@ -1307,31 +1307,54 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
         WM_TIMER=>{
             let changed=STATE.with(|cell|{
                 let mut state=cell.borrow_mut();
-                let Some(app)=state.as_mut()else{return false};
-                if !app.active {
-                    app.watchdog.drain();
+                let Some(app)=state.as_mut()else{return false;};
+                let when=now();
+                let cpu=current_processor();
+                let handler_ticks=GUI_HANDLER_MAX.with(|x|x.replace(0));
+                let handler_max=handler_ticks as f64*1000.0/app.frequency as f64;
+                app.thread_metrics.gui_pulse(when,handler_max,cpu.group,cpu.number);
+                // Bounded: a burst can never force an unbounded UI callback.
+                // Generation IDs prevent cross-mode/stale keyboard captures.
+                let (events,generation)=app.capture.as_ref()
+                    .map_or_else(||(Vec::new(),0),|c|
+                        (c.drain(MAX_DRAIN_PER_PULSE),c.generation()));
+                if !app.active{
+                    app.watchdog.drain();app.capture_watchdog.drain();
                     return false;
                 }
-                let when=now();
-                app.flight.finish(when);
+                let mut changed=false;
+                for event in events{
+                    if event.generation==generation {
+                        changed|=consume_captured(hwnd,app,event);
+                    }
+                }
+                app.flight.finish(now());
                 for gap in app.watchdog.drain(){
                     if matches!(app.mode,2|4|5){
+                        app.thread_metrics.gap(false,gap.ended,gap.duration_ms);
                         app.flight.observe(FlightEvent::new(gap.ended,
                             Lane::Watchdog,"GUI_STALL",0,0,
                             gap.duration_ms.round() as i32,0));
                     }
                 }
+                for gap in app.capture_watchdog.drain(){
+                    if matches!(app.mode,2|4|5){
+                        app.thread_metrics.gap(true,gap.ended,gap.duration_ms);
+                        app.flight.observe(FlightEvent::new(gap.ended,
+                            Lane::Watchdog,"CAPTURE_STALL",0,0,
+                            gap.duration_ms.round() as i32,0));
+                    }
+                }
                 if app.mode==2 || app.mode==4 {
                     let when=now();
-                    let observed=app.keyboard.observed_vk_states();
-                    for (vk,label,raw_down) in observed {
-                        let os_down=GetAsyncKeyState(vk as i32) < 0;
+                    for (vk,label,raw_down) in app.keyboard.observed_vk_states(){
+                        let os_down=GetAsyncKeyState(vk as i32)<0;
                         app.os_keys.sample(vk,&label,raw_down,os_down,when);
                     }
                 }
-                if app.mode==3 { app.reaction.tick(now()) } else {false}
+                if app.mode==3{app.reaction.tick(now())|changed}else{changed}
             });
-            if changed {InvalidateRect(hwnd,null(),0);}
+            if changed{InvalidateRect(hwnd,null(),0);}
             refresh();
             return 0;
         }
@@ -1385,14 +1408,25 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_VISIBLE,
             100,45,950,966,null_mut(),null_mut(),instance,null());
         if hwnd.is_null(){return Err(io::Error::last_os_error().into());}
-        let devices=[
-            RawDevice{page:1,usage:2,flags:RIDEV_INPUTSINK,hwnd},
-            RawDevice{page:1,usage:6,flags:RIDEV_INPUTSINK,hwnd},
-        ];
-        if RegisterRawInputDevices(devices.as_ptr(),2,size_of::<RawDevice>() as u32)==0{
-            let e=io::Error::last_os_error();error(hwnd,&format!("Raw Input: {e}"));
-            DestroyWindow(hwnd);return Err(e.into());
-        }
+        // Register Raw Input on a separate message-only window/thread.
+        // Never also register it on the GUI: Windows permits only one receiver
+        // per input class per process, and the last registration wins.
+        let heartbeat=STATE.with(|cell|{
+            cell.borrow().as_ref().unwrap().capture_watchdog.heartbeat()
+        });
+        let capture=match InputCapture::start(frequency,heartbeat){
+            Ok(worker)=>worker,
+            Err(e)=>{
+                error(hwnd,&format!("Could not start isolated Raw Input receiver: {e}"));
+                DestroyWindow(hwnd);return Err(e.into());
+            }
+        };
+        STATE.with(|cell|{
+            let mut state=cell.borrow_mut();
+            let app=state.as_mut().unwrap();
+            app.capture=Some(capture);
+            sync_capture(app);
+        });
         // 20 Hz display refresh; timestamps remain captured immediately on input.
         SetTimer(hwnd,1,50,null_mut());
         ShowWindow(hwnd,SW_SHOW);UpdateWindow(hwnd);
@@ -1404,5 +1438,7 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             TranslateMessage(&m);DispatchMessageW(&m);
         }
     }
+    // Stop the independent capture receiver before returning from run().
+    STATE.with(|cell|{*cell.borrow_mut()=None;});
     Ok(())
 }
