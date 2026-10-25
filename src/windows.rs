@@ -242,8 +242,11 @@ fn record_key_message(msg:u32,wp:WP,lp:LP){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             if app.active && (app.mode==2 || app.mode==4 || app.mode==5) {
-                app.flight.observe(FlightEvent::new(t,Lane::WinKey,tag,wp as u16,0,
-                    (lp as u64 & 0xffff) as i32,age));
+                // Mouse mode records mouse motion, not a second typed-key history.
+                if app.mode==2 || app.mode==4 {
+                    app.flight.observe(FlightEvent::new(t,Lane::WinKey,tag,wp as u16,0,
+                        (lp as u64 & 0xffff) as i32,age));
+                }
                 app.trace.record(TraceEvent::keyboard_msg(t,tag,wp,lp,age,queued,first_pending_raw_size()));
             }
         }
