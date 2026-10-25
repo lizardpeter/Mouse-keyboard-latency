@@ -13,13 +13,13 @@ pub struct MouseDiagnostics {
     frequency:i64,epoch:i64,last_motion:Option<i64>,
     pub samples:Vec<MouseSample>,pub dropped:u64,
     pub motion:u64,pub buttons:u64,pub accumulated_x:i64,pub accumulated_y:i64,
-    interval_ms:Vec<f64>,
+    interval_ms:Vec<f64>,interval_cursor:usize,
 }
 impl MouseDiagnostics {
     pub fn new(frequency:i64,epoch:i64)->Self{
         Self{frequency,epoch,last_motion:None,samples:Vec::with_capacity(CAP),
              dropped:0,motion:0,buttons:0,accumulated_x:0,accumulated_y:0,
-             interval_ms:Vec::with_capacity(CAP)}
+             interval_ms:Vec::with_capacity(2048),interval_cursor:0}
     }
     pub fn observe(&mut self,time:i64,device:usize,dx:i32,dy:i32,
                    absolute:bool,buttons:u16,x:i32,y:i32) {
@@ -30,7 +30,13 @@ impl MouseDiagnostics {
             self.last_motion=Some(time); self.motion+=1;
             self.accumulated_x+=dx as i64; self.accumulated_y+=dy as i64;
             if let Some(ms)=gap {
-                if ms>0.0 && self.interval_ms.len()<CAP {self.interval_ms.push(ms);}
+                if ms>0.0 {
+                    if self.interval_ms.len()<2048 {self.interval_ms.push(ms);}
+                    else {
+                        self.interval_ms[self.interval_cursor]=ms;
+                        self.interval_cursor=(self.interval_cursor+1)%2048;
+                    }
+                }
             }
             gap
         } else {None};
@@ -42,8 +48,7 @@ impl MouseDiagnostics {
     }
     pub fn frequency_stats(&self)->Option<(f64,f64,f64)> {
         if self.interval_ms.is_empty(){return None;}
-        let start=self.interval_ms.len().saturating_sub(2048);
-        let mut values=self.interval_ms[start..].to_vec();
+        let mut values=self.interval_ms.clone();
         values.sort_by(|a,b|a.total_cmp(b));
         let median=values[values.len()/2];
         let p95=values[((values.len()-1) as f64*0.95).round() as usize];
