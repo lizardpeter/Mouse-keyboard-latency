@@ -679,6 +679,8 @@ fn refresh() {
         if let Some(v)=app.flight_views.as_ref(){
             if app.mode==6 {
                 set_text(v.status,&app.flight.summary());
+                let dropped=app.capture.as_ref().map_or(0,InputCapture::dropped);
+                set_text(v.threads,&app.thread_metrics.short_status(dropped));
                 set_text(v.markers,&app.flight.marker_list());
                 let (start,end)=app.flight.view_bounds_ms(timestamp);
                 set_text(v.window,&format!(
@@ -925,6 +927,8 @@ fn save_report(hwnd:H) {
             app.polling.append_report(&mut snapshot,now());
             append_device_inventory(&app.trace,&mut snapshot);
         }
+        app.thread_metrics.append_report(&mut snapshot,
+            app.capture.as_ref().map_or(0,InputCapture::dropped));
         (previous,snapshot)
     });
     if contents.is_empty(){return;}
@@ -1132,6 +1136,7 @@ unsafe fn make_gui(hwnd:H){
     control(hwnd,instance,"BUTTON","Newer >>",ID_FLIGHT_FORWARD,
         376,337,112,30,WS_TABSTOP|BS_PUSHBUTTON,f_small);
     let flight_window=text(hwnd,instance,"",496,339,406,27,f_small);
+    let flight_threads=text(hwnd,instance,"",32,371,860,24,f_small);
     text(hwnd,instance,"CAPTURE MARKERS / AUTOMATIC DETECTIONS",32,794,865,24,f_medium);
     let flight_markers=control(hwnd,instance,"EDIT","",0,
         32,822,870,80,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
@@ -1141,7 +1146,7 @@ unsafe fn make_gui(hwnd:H){
     CREATE_GROUP.with(|g|g.set(0));
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
-            app.flight_views=Some(FlightViews{status:flight_status,markers:flight_markers,window:flight_window});
+            app.flight_views=Some(FlightViews{status:flight_status,markers:flight_markers,window:flight_window,threads:flight_threads});
             app.labels=Some(Labels{
                 start,recording,
                 mouse_count,mouse_last,mouse_age,mouse_interval,
