@@ -658,12 +658,10 @@ fn refresh() {
             if app.mode==6 {
                 set_text(v.status,&app.flight.summary());
                 set_text(v.markers,&app.flight.marker_list());
-                let end=app.flight.current_end(timestamp);
-                let start=end.saturating_sub((app.flight.width_ms*app.frequency as f64/1000.0) as i64);
+                let (start,end)=app.flight.view_bounds_ms(timestamp);
                 set_text(v.window,&format!(
-                    "Window {:.3}–{:.3} s after recording start | width {:.3} s | pan {:.3} s",
-                    start as f64/app.frequency as f64,
-                    end as f64/app.frequency as f64,
+                    "View {:.3}–{:.3}s | span {:.2}s | pan {:.2}s",
+                    start/1000.0,end/1000.0,
                     app.flight.width_ms/1000.0,app.flight.pan_ms/1000.0));
             }
         }
