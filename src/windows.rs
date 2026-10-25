@@ -953,9 +953,14 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                                 mouse.last_x,mouse.last_y,mouse.flags&1!=0,
                                 mouse.buttons as u16,p.x,p.y);
                         }
-                        app.trace.record(TraceEvent::raw(tick,"RAW_MOUSE",0,0,
-                            age,bits,raw.header.device as usize,
-                            mouse.last_x,mouse.last_y,p.x,p.y,mouse.buttons as u16,0));
+                        // In keyboard/typing tests preserve trace capacity for
+                        // keyboard events and intentional mouse-button markers.
+                        // High-Hz mouse movement can otherwise exhaust 100k rows quickly.
+                        if app.mode==5 || mouse.buttons as u16!=0 {
+                            app.trace.record(TraceEvent::raw(tick,"RAW_MOUSE",0,0,
+                                age,bits,raw.header.device as usize,
+                                mouse.last_x,mouse.last_y,p.x,p.y,mouse.buttons as u16,0));
+                        }
                     } else if raw.header.kind==1 {
                         let k=raw.data.key;
                         app.trace.record(TraceEvent::raw(tick,"RAW_KEY",k.key,k.make,
