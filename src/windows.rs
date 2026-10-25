@@ -106,6 +106,7 @@ extern "system" {
     fn PostQuitMessage(code:i32);
     fn RegisterRawInputDevices(devices:*const RawDevice,count:u32,size:u32)->i32;
     fn GetRawInputData(handle:H,command:u32,out:H,bytes:*mut u32,header:u32)->u32;
+    fn GetRawInputBuffer(data:H,bytes:*mut u32,header:u32)->u32;
     fn SetWindowTextW(hwnd:H,text:*const u16)->i32;
     fn SetWindowLongPtrW(hwnd:H,index:i32,new_ptr:isize)->isize;
     fn CallWindowProcW(prev:isize,hwnd:H,msg:u32,wp:WP,lp:LP)->LP;
@@ -210,6 +211,13 @@ fn queue_bits()->u32 {
     // High word shows present queue bits. GetQueueStatus does not remove messages.
     unsafe{GetQueueStatus(QS_KEY|QS_RAWINPUT)>>16}
 }
+fn first_pending_raw_size()->u32{
+    // Null-output size QUERY ONLY: does not drain/remove any Raw Input records.
+    // Reports size of the FIRST waiting record, not number or total bytes.
+    let mut bytes=0u32;
+    unsafe{GetRawInputBuffer(null_mut(),&mut bytes,size_of::<RawHeader>() as u32);}
+    bytes
+}
 fn message_age()->u32{
     unsafe{(GetTickCount64() as u32).wrapping_sub(GetMessageTime() as u32)}
 }
@@ -223,7 +231,7 @@ fn record_key_message(msg:u32,wp:WP,lp:LP){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             if app.active {
-                app.trace.record(TraceEvent::keyboard_msg(t,tag,wp,lp,age,queued));
+                app.trace.record(TraceEvent::keyboard_msg(t,tag,wp,lp,age,queued,first_pending_raw_size()));
             }
         }
     });
@@ -947,11 +955,11 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                         }
                         app.trace.record(TraceEvent::raw(tick,"RAW_MOUSE",0,0,
                             age,bits,raw.header.device as usize,
-                            mouse.last_x,mouse.last_y,p.x,p.y,mouse.buttons as u16));
+                            mouse.last_x,mouse.last_y,p.x,p.y,mouse.buttons as u16,0));
                     } else if raw.header.kind==1 {
                         let k=raw.data.key;
                         app.trace.record(TraceEvent::raw(tick,"RAW_KEY",k.key,k.make,
-                            age,bits,raw.header.device as usize,0,0,0,0,0));
+                            age,bits,raw.header.device as usize,0,0,0,0,0,first_pending_raw_size()));
                     }
                     match raw.header.kind {
                         0 if got as usize>=size_of::<RawHeader>()+size_of::<RawMouse>()=>{
