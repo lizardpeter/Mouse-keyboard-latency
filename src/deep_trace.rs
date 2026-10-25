@@ -10,25 +10,25 @@ pub struct TraceEvent {
     pub repeats: u16, pub prev_down: bool, pub transition: bool,
     pub msg_age_ms: u32, pub queue_bits: u32, pub device: usize,
     pub dx: i32, pub dy: i32, pub cursor_x: i32, pub cursor_y: i32,
-    pub buttons: u16,
+    pub buttons: u16,pub first_pending_raw_bytes:u32,
 }
 impl TraceEvent {
     pub fn keyboard_msg(qpc:i64, kind:&'static str, vk:usize, lp:isize,
-                        age:u32, queued:u32)->Self {
+                        age:u32, queued:u32,pending_raw:u32)->Self {
         let bits=lp as usize;
         Self {
             qpc,kind,vk:vk as u16,scan:((bits>>16)&255) as u16,
             repeats:(bits&0xffff) as u16,
             prev_down:(bits&(1<<30))!=0,transition:(bits&(1<<31))!=0,
             msg_age_ms:age,queue_bits:queued,device:0,dx:0,dy:0,
-            cursor_x:0,cursor_y:0,buttons:0,
+            cursor_x:0,cursor_y:0,buttons:0,first_pending_raw_bytes:pending_raw,
         }
     }
     pub fn raw(qpc:i64, kind:&'static str, vk:u16, scan:u16,
                age:u32, queued:u32,device:usize,dx:i32,dy:i32,
-               cursor_x:i32,cursor_y:i32,buttons:u16)->Self {
+               cursor_x:i32,cursor_y:i32,buttons:u16,pending_raw:u32)->Self {
         Self {qpc,kind,vk,scan,repeats:0,prev_down:false,transition:false,
-            msg_age_ms:age,queue_bits:queued,device,dx,dy,cursor_x,cursor_y,buttons}
+            msg_age_ms:age,queue_bits:queued,device,dx,dy,cursor_x,cursor_y,buttons,first_pending_raw_bytes:pending_raw}
     }
 }
 pub struct DeepTrace {
@@ -87,12 +87,12 @@ impl DeepTrace {
         let _=writeln!(out,"Long dispatch gaps include intentional inactivity and are not automatically stalls.");
         let _=writeln!(out,"{}",self.summary());
         let _=writeln!(out,"Events: {} (dropped after cap: {})",self.events.len(),self.dropped);
-        let _=writeln!(out,"time_ms | type | vk | scan | key_repeat_count | prev_down | transition | queue_age_ms | queue_bits | device_handle | raw_dx | raw_dy | cursor_x | cursor_y | mouse_buttons");
+        let _=writeln!(out,"time_ms | type | vk | scan | key_repeat_count | prev_down | transition | queue_age_ms | queue_bits | device_handle | raw_dx | raw_dy | cursor_x | cursor_y | mouse_buttons | first_pending_raw_bytes");
         for e in &self.events {
-            let _=writeln!(out,"{:.3} | {} | {} | {} | {} | {} | {} | {} | 0x{:04x} | 0x{:x} | {} | {} | {} | {} | 0x{:04x}",
+            let _=writeln!(out,"{:.3} | {} | {} | {} | {} | {} | {} | {} | 0x{:04x} | 0x{:x} | {} | {} | {} | {} | 0x{:04x} | {}",
                 self.to_ms(e.qpc),e.kind,e.vk,e.scan,e.repeats,e.prev_down,
                 e.transition,e.msg_age_ms,e.queue_bits,e.device,
-                e.dx,e.dy,e.cursor_x,e.cursor_y,e.buttons);
+                e.dx,e.dy,e.cursor_x,e.cursor_y,e.buttons,e.first_pending_raw_bytes);
         }
     }
 }
@@ -102,7 +102,7 @@ impl DeepTrace {
         let mut t=DeepTrace::new(1_000_000,0);
         t.observe_dispatch(100,0);
         t.observe_dispatch(60_200,0x20);
-        t.record(TraceEvent::keyboard_msg(60_200,"WM_KEYDOWN",68,0x4000_0004,1,0x20));
+        t.record(TraceEvent::keyboard_msg(60_200,"WM_KEYDOWN",68,0x4000_0004,1,0x20,48));
         assert_eq!(t.combined_repeats,3);
         assert_eq!(t.large_dispatch_gaps,1);
         assert!(t.summary().contains("Combined repeats: 3"));
