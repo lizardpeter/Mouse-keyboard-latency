@@ -104,6 +104,13 @@ impl ThreadMetrics{
             if capture{b.capture_stalls+=1;}else{b.gui_stalls+=1;}
         }
     }
+    pub fn short_status(&self,dropped:u64)->String{
+        let cpu=|p:Option<(u16,u8)>|p.map_or_else(||"?".into(),
+            |(g,n)|format!("{g}:{n}"));
+        format!("Input CPU {}  GUI CPU {}  |  input stalls {}  GUI stalls {}  |                  GUI handoff max {:.1}ms  |  dropped {}",
+            cpu(self.latest_capture_cpu),cpu(self.latest_gui_cpu),
+            self.capture_stalls,self.gui_stalls,self.max_gui_handoff_ms,dropped)
+    }
     pub fn status(&self,dropped:u64)->String{
         let cpu=|p:Option<(u16,u8)>|p.map_or_else(||"unknown".into(),
             |(g,n)|format!("group {g} / CPU {n}"));
