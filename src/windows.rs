@@ -230,7 +230,7 @@ impl Drop for HandlerCost{
     }
 }
 fn sync_capture(app:&mut State){
-    if let Some(c)=app.capture.as_ref(){c.set_enabled(app.active && app.mode!=6);}
+    if let Some(c)=app.capture.as_ref(){c.set_mode(app.mode);c.set_enabled(app.active && app.mode!=6);}
     let enabled=app.active && matches!(app.mode,2|4|5);
     app.watchdog.set_active(enabled,now());
     app.capture_watchdog.set_active(enabled,now());
