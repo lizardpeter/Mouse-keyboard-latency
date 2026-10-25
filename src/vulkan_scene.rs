@@ -392,7 +392,9 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             WS_VISIBLE|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
             120,80,1280,760,null_mut(),null_mut(),inst,null());
         if hwnd.is_null(){return Err(io::Error::last_os_error().into());}
-        let raw=[RawDevice{page:1,usage:2,flags:RIDEV_INPUTSINK,hwnd}];
+        // Only accept Raw Input while the scene is focused; never monitor games
+        // or another application's mouse movement in the background.
+        let raw=[RawDevice{page:1,usage:2,flags:0,hwnd}];
         if RegisterRawInputDevices(raw.as_ptr(),1,size_of::<RawDevice>() as u32)==0{
             return Err(io::Error::last_os_error().into());
         }
