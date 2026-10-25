@@ -947,11 +947,11 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                         }
                         app.trace.record(TraceEvent::raw(tick,"RAW_MOUSE",0,0,
                             age,bits,raw.header.device as usize,
-                            mouse.last_x,mouse.last_y,p.x,p.y));
+                            mouse.last_x,mouse.last_y,p.x,p.y,mouse.buttons as u16));
                     } else if raw.header.kind==1 {
                         let k=raw.data.key;
                         app.trace.record(TraceEvent::raw(tick,"RAW_KEY",k.key,k.make,
-                            age,bits,raw.header.device as usize,0,0,0,0));
+                            age,bits,raw.header.device as usize,0,0,0,0,0));
                     }
                     match raw.header.kind {
                         0 if got as usize>=size_of::<RawHeader>()+size_of::<RawMouse>()=>{
