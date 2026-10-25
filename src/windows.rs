@@ -10,6 +10,8 @@ use crate::mouse_diagnostics::MouseDiagnostics;
 use crate::polling::PollingMonitor;
 use crate::flight::{FlightRecorder,FlightEvent,Lane,LANES};
 use crate::watchdog::Watchdog;
+use crate::input_capture::{InputCapture,CapturedInput,Kind as CapturedKind,MAX_DRAIN_PER_PULSE,current_processor};
+use crate::thread_metrics::{ThreadMetrics,TimingSample};
 use crate::hid_poll::get_hid_polled_interval_ms;
 use std::fmt::Write as _;
 use std::cell::Cell;
@@ -198,7 +200,7 @@ struct TypingViews {
     input:H, stats:H, last_gap:H, text_log:H, raw_log:H,
 }
 struct MouseViews{stats:H,recent:H,deep:H}
-struct FlightViews{status:H,markers:H,window:H}
+struct FlightViews{status:H,markers:H,window:H,threads:H}
 struct State {
     session:Session, active:bool, labels:Option<Labels>, note:String,
     mode:usize, groups:[Vec<H>;7],
@@ -210,14 +212,29 @@ struct State {
     trace:DeepTrace, mouse_diag:MouseDiagnostics, mouse_views:Option<MouseViews>,
     polling:PollingMonitor,
     flight:FlightRecorder,flight_views:Option<FlightViews>,watchdog:Watchdog,
+    capture_watchdog:Watchdog,capture:Option<InputCapture>,thread_metrics:ThreadMetrics,
 }
 thread_local! {
     static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
     static CREATE_GROUP:Cell<usize>=const{Cell::new(0)};
     static ORIGINAL_TYPING_PROC:Cell<isize>=const{Cell::new(0)};
+    static GUI_HANDLER_MAX:Cell<i64>=const{Cell::new(0)};
 }
 
 fn now()->i64 {let mut v=0; unsafe{QueryPerformanceCounter(&mut v);} v}
+struct HandlerCost(i64);
+impl Drop for HandlerCost{
+    fn drop(&mut self){
+        let spent=now().saturating_sub(self.0);
+        GUI_HANDLER_MAX.with(|max|{if spent>max.get(){max.set(spent);}});
+    }
+}
+fn sync_capture(app:&mut State){
+    if let Some(c)=app.capture.as_ref(){c.set_enabled(app.active && app.mode!=6);}
+    let enabled=app.active && matches!(app.mode,2|4|5);
+    app.watchdog.set_active(enabled,now());
+    app.capture_watchdog.set_active(enabled,now());
+}
 fn queue_bits()->u32 {
     // High word shows present queue bits. GetQueueStatus does not remove messages.
     unsafe{GetQueueStatus(QS_KEY|QS_RAWINPUT)>>16}
@@ -400,12 +417,14 @@ fn select_mode(hwnd:H,new_mode:usize){
             }
         }
         app.watchdog.set_active(app.active && matches!(new_mode,2|4|5),now());
+        app.capture_watchdog.set_active(app.active && matches!(new_mode,2|4|5),now());
         if app.mode!=new_mode && (app.mode==2 || app.mode==4 || new_mode==2 || new_mode==4) {
             app.keyboard.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
         }
         app.mode=new_mode;
+        sync_capture(app);
         app.note=match new_mode{
             1=>"Mouse and Space events update live on this page.".into(),
             2=>"Test key combinations; press and release keys to watch their states.".into(),
@@ -730,13 +749,14 @@ fn refresh() {
 fn toggle(){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
-            app.watchdog.set_active(!app.active && matches!(app.mode,2|4|5),now());
+            // Both watchdogs are reset after changing active state.
             app.flight.clear_temporal_state();
             app.session.break_pair();
             app.keyboard.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.active=!app.active;
+            sync_capture(app);
             if !app.active{app.flight.finish_early();}
             app.note=if app.active{
                 "Recording: press LEFT CLICK + SPACE, releasing both before repeating.".into()
@@ -751,7 +771,7 @@ fn reset(){
             if matches!(app.mode,2|4|5|6){
                 app.flight=FlightRecorder::new(app.frequency,now());
                 app.watchdog.drain();
-                app.watchdog.set_active(app.active && matches!(app.mode,2|4|5),now());
+                sync_capture(app);
             }
             match app.mode{
                 6=>{app.note="Flight recorder cleared; switch to Keyboard, Typing, or Mouse to arm again.".into();},
@@ -795,7 +815,7 @@ fn save(hwnd:H){
         let prior=app.active;
         app.active=false;
         app.flight.finish_early();
-        app.watchdog.set_active(false,now());
+        sync_capture(app);
         app.session.break_pair();
         (prior,app.mode,now())
     });
@@ -855,7 +875,7 @@ fn save(hwnd:H){
             app.typing.suspend();
             app.session.break_pair();
             app.active=was_active;
-            app.watchdog.set_active(was_active && matches!(app.mode,2|4|5),now());
+            sync_capture(app);
         }
     });
     refresh();
@@ -881,7 +901,7 @@ fn save_report(hwnd:H) {
         let previous=app.active;
         app.active=false;
         app.flight.finish_early();
-        app.watchdog.set_active(false,now());
+        sync_capture(app);
         let mut snapshot=if app.mode==6 {
             String::new()
         }else if app.mode==5 {
@@ -945,7 +965,7 @@ fn save_report(hwnd:H) {
             app.typing.suspend();
             app.session.break_pair();
             app.active=was_active;
-            app.watchdog.set_active(was_active && matches!(app.mode,2|4|5),now());
+            sync_capture(app);
         }
     });
     refresh();
@@ -1377,6 +1397,8 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             polling:PollingMonitor::new(frequency),
             flight:FlightRecorder::new(frequency,now()),flight_views:None,
             watchdog:Watchdog::new(frequency,now),
+            capture_watchdog:Watchdog::new(frequency,now),capture:None,
+            thread_metrics:ThreadMetrics::new(frequency,now()),
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");
