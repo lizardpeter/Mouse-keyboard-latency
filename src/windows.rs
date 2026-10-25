@@ -230,7 +230,7 @@ fn record_key_message(msg:u32,wp:WP,lp:LP){
     let t=now();let queued=queue_bits();let age=message_age();
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
-            if app.active {
+            if app.active && (app.mode==2 || app.mode==4 || app.mode==5) {
                 app.trace.record(TraceEvent::keyboard_msg(t,tag,wp,lp,age,queued,first_pending_raw_size()));
             }
         }
@@ -364,6 +364,14 @@ fn select_mode(hwnd:H,new_mode:usize){
         let mut cell=cell.borrow_mut();
         let Some(app)=cell.as_mut()else{return};
         app.session.break_pair();
+        if app.mode!=new_mode {
+            // Explicit diagnostic-mode selection is the privacy boundary:
+            // do not carry key histories between unrelated capture sessions.
+            app.trace=DeepTrace::new(app.frequency,now());
+            if new_mode==5 {
+                app.mouse_diag=MouseDiagnostics::new(app.frequency,now());
+            }
+        }
         if app.mode!=new_mode && (app.mode==2 || app.mode==4 || new_mode==2 || new_mode==4) {
             app.keyboard.suspend();
             app.os_keys.clear_pending();
@@ -956,12 +964,12 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                         // In keyboard/typing tests preserve trace capacity for
                         // keyboard events and intentional mouse-button markers.
                         // High-Hz mouse movement can otherwise exhaust 100k rows quickly.
-                        if app.mode==5 || mouse.buttons as u16!=0 {
+                        if app.mode==5 || ((app.mode==2 || app.mode==4) && mouse.buttons as u16!=0) {
                             app.trace.record(TraceEvent::raw(tick,"RAW_MOUSE",0,0,
                                 age,bits,raw.header.device as usize,
                                 mouse.last_x,mouse.last_y,p.x,p.y,mouse.buttons as u16,0));
                         }
-                    } else if raw.header.kind==1 {
+                    } else if raw.header.kind==1 && (app.mode==2 || app.mode==4 || app.mode==5) {
                         let k=raw.data.key;
                         app.trace.record(TraceEvent::raw(tick,"RAW_KEY",k.key,k.make,
                             age,bits,raw.header.device as usize,0,0,0,0,0,first_pending_raw_size()));
