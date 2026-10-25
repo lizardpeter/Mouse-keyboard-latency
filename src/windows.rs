@@ -5,6 +5,9 @@ use crate::core::{Kind, Session, DeviceSnapshot};
 use crate::keyboard::{KeyboardDiagnostics,KeyId,OsKeyStateMonitor};
 use crate::reaction::{ReactionTest,Phase};
 use crate::typing::TypingMonitor;
+use crate::deep_trace::{DeepTrace,TraceEvent};
+use crate::mouse_diagnostics::MouseDiagnostics;
+use std::fmt::Write as _;
 use std::cell::Cell;
 use std::{cell::RefCell, ffi::c_void, io, mem::{size_of, zeroed}, path::Path,
     ptr::{null, null_mut}};
@@ -18,6 +21,9 @@ const WM_INPUT:u32=0xFF; const WM_TIMER:u32=0x113; const WM_SETFONT:u32=0x30;
 const WM_CTLCOLORSTATIC:u32=0x138; const WM_ERASEBKGND:u32=0x14;
 const WM_SIZE:u32=5; const WM_KEYDOWN:u32=0x100; const WM_PAINT:u32=0x0F;
 const WM_CHAR:u32=0x102; const GWLP_WNDPROC:i32=-4;
+const WM_KEYUP:u32=0x101; const WM_SYSKEYDOWN:u32=0x104; const WM_SYSKEYUP:u32=0x105;
+const QS_KEY:u32=1; const QS_RAWINPUT:u32=0x400;
+const RIDI_DEVICENAME:u32=0x20000007;
 const WS_VSCROLL:u32=0x00200000;
 const ES_MULTILINE:u32=0x0004; const ES_AUTOVSCROLL:u32=0x0040;
 const ES_WANTRETURN:u32=0x1000; const ES_READONLY:u32=0x0800;
@@ -36,6 +42,7 @@ const ID_TYPING_TEXTLOG:usize=307; const ID_TYPING_RAWLOG:usize=308;
 const ID_MODE_COMPARE:usize=201; const ID_MODE_KEYBOARD:usize=202;
 const ID_MODE_REACTION:usize=203; const ID_REACTION_ARM:usize=204;
 const ID_MODE_TYPING:usize=205;
+const ID_MODE_MOUSE:usize=206; const ID_VULKAN_SCENE:usize=207;
 const FONT_NORMAL:i32=400; const FONT_BOLD:i32=700;
 const OFN_OVERWRITEPROMPT:u32=2; const OFN_PATHMUSTEXIST:u32=0x800;
 const ERROR_ICON:u32=0x10; const BLACK:u32=0x00251D18;
@@ -121,6 +128,8 @@ extern "system" {
     fn MessageBoxW(hwnd:H,text:*const u16,caption:*const u16,flags:u32)->i32;
     fn GetAsyncKeyState(virtual_key:i32)->i16;
     fn GetMessageTime()->i32;
+    fn GetQueueStatus(flags:u32)->u32;
+    fn GetRawInputDeviceInfoW(device:H,command:u32,out:H,size:*mut u32)->u32;
     fn SetBkMode(dc:H,mode:i32)->i32;
     fn SetTextColor(dc:H,color:u32)->u32;
 }
@@ -179,14 +188,16 @@ struct ReactionViews {
 struct TypingViews {
     input:H, stats:H, last_gap:H, text_log:H, raw_log:H,
 }
+struct MouseViews{stats:H,recent:H,deep:H}
 struct State {
     session:Session, active:bool, labels:Option<Labels>, note:String,
-    mode:usize, groups:[Vec<H>;5],
+    mode:usize, groups:[Vec<H>;6],
     frequency:i64,
     keyboard:KeyboardDiagnostics, os_keys:OsKeyStateMonitor,
     key_views:Option<KeyboardViews>,
     reaction:ReactionTest, reaction_views:Option<ReactionViews>,
     typing:TypingMonitor, typing_views:Option<TypingViews>,
+    trace:DeepTrace, mouse_diag:MouseDiagnostics, mouse_views:Option<MouseViews>,
 }
 thread_local! {
     static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
@@ -195,6 +206,59 @@ thread_local! {
 }
 
 fn now()->i64 {let mut v=0; unsafe{QueryPerformanceCounter(&mut v);} v}
+fn queue_bits()->u32 {
+    // High word shows present queue bits. GetQueueStatus does not remove messages.
+    unsafe{GetQueueStatus(QS_KEY|QS_RAWINPUT)>>16}
+}
+fn message_age()->u32{
+    unsafe{(GetTickCount64() as u32).wrapping_sub(GetMessageTime() as u32)}
+}
+fn record_key_message(msg:u32,wp:WP,lp:LP){
+    let tag=match msg {
+        WM_KEYDOWN=>"WM_KEYDOWN",WM_KEYUP=>"WM_KEYUP",
+        WM_SYSKEYDOWN=>"WM_SYSKEYDOWN",WM_SYSKEYUP=>"WM_SYSKEYUP",
+        _=>return
+    };
+    let t=now();let queued=queue_bits();let age=message_age();
+    STATE.with(|cell|{
+        if let Some(app)=cell.borrow_mut().as_mut(){
+            if app.active {
+                app.trace.record(TraceEvent::keyboard_msg(t,tag,wp,lp,age,queued));
+            }
+        }
+    });
+}
+fn append_device_inventory(trace:&DeepTrace,out:&mut String){
+    use std::collections::BTreeSet;
+    let devices: BTreeSet<usize>=trace.events.iter().filter_map(|e|
+        (e.device!=0).then_some(e.device)).collect();
+    let _=writeln!(out,"\nRAW INPUT DEVICE IDENTIFIERS (device serial/path redacted)");
+    for device in devices {
+        let mut size=0u32;
+        let rc=unsafe{GetRawInputDeviceInfoW(device as H,RIDI_DEVICENAME,null_mut(),&mut size)};
+        if rc==u32::MAX || size==0 || size>8192 {
+            let _=writeln!(out,"device_handle=0x{device:x} VID/PID unavailable");
+            continue;
+        }
+        let mut buffer=vec![0u16;size as usize];
+        let read=unsafe{GetRawInputDeviceInfoW(device as H,RIDI_DEVICENAME,
+            buffer.as_mut_ptr().cast(),&mut size)};
+        if read==u32::MAX {
+            let _=writeln!(out,"device_handle=0x{device:x} VID/PID unavailable");
+            continue;
+        }
+        let path=String::from_utf16_lossy(&buffer[..(read as usize).min(buffer.len())]);
+        let up=path.to_ascii_uppercase();
+        let token=|tag:&str|{
+            up.find(tag).and_then(|start|up.get(start+tag.len()..start+tag.len()+4))
+                .filter(|x|x.chars().all(|c|c.is_ascii_hexdigit()))
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        let _=writeln!(out,"device_handle=0x{device:x} VID={} PID={}",token("VID_"),token("PID_"));
+    }
+}
+
 unsafe fn control(parent:H,instance:H,class:&str,text:&str,id:usize,
     x:i32,y:i32,w:i32,h:i32,style:u32,font:H)->H {
     let hwnd=CreateWindowExW(0,wide(class).as_ptr(),wide(text).as_ptr(),
@@ -225,6 +289,9 @@ fn get_text(hwnd:H)->String {
 /// Observe real character messages delivered to the native test EDIT control.
 /// Only this specific, focused textbox is subclassed; no global Windows hooks.
 unsafe extern "system" fn typing_edit_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP {
+    if matches!(msg,WM_KEYDOWN|WM_KEYUP|WM_SYSKEYDOWN|WM_SYSKEYUP){
+        record_key_message(msg,wp,lp);
+    }
     if msg==WM_CHAR {
         let tick=now();
         STATE.with(|cell|{
@@ -282,7 +349,7 @@ fn key_name(vk:u16,scan:u16,flags:u16)->String {
 
 fn mode_title(m:usize)->&'static str {
     match m { 1=>"1 · Input comparison",2=>"2 · Keyboard diagnostics",
-        3=>"3 · Mouse reaction time",4=>"4 · Typing test",_=>"Unknown" }
+        3=>"3 · Mouse reaction time",4=>"4 · Typing test",5=>"5 · Mouse diagnostics",_=>"Unknown" }
 }
 fn select_mode(hwnd:H,new_mode:usize){
     STATE.with(|cell|{
@@ -300,6 +367,7 @@ fn select_mode(hwnd:H,new_mode:usize){
             2=>"Test key combinations; press and release keys to watch their states.".into(),
             3=>"Click Start trial, wait for GREEN, then click the colored panel.".into(),
             4=>"Click the typing box and type test text. Watch both WM_CHAR and Raw Input timings.".into(),
+            5=>"Move the mouse continuously. Compare raw report spacing with sampled Windows pointer movement.".into(),
             _=>String::new(),
         };
         for (i,group) in app.groups.iter().enumerate(){
