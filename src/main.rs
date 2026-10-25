@@ -8,6 +8,8 @@ mod deep_trace;
 mod mouse_diagnostics;
 mod polling;
 mod flight;
+mod thread_metrics;
+#[cfg(windows)]mod input_capture;
 #[cfg(windows)]mod watchdog;
 #[cfg(windows)]mod hid_poll;
 #[cfg(windows)] mod vulkan_scene;
