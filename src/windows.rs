@@ -1060,6 +1060,15 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                                 mouse.last_x,mouse.last_y,mouse.flags&1!=0,
                                 mouse.buttons as u16,p.x,p.y);
                         }
+                        if app.mode==5 ||
+                            ((app.mode==2||app.mode==4) && mouse.buttons as u16!=0)
+                        {
+                            app.flight.observe(FlightEvent::new(tick,Lane::Mouse,
+                                if mouse.buttons as u16!=0{"BUTTON"}else{"MOVE"},
+                                0,raw.header.device as usize,
+                                mouse.last_x.saturating_abs().saturating_add(
+                                    mouse.last_y.saturating_abs()),age));
+                        }
                         // In keyboard/typing tests preserve trace capacity for
                         // keyboard events and intentional mouse-button markers.
                         // High-Hz mouse movement can otherwise exhaust 100k rows quickly.
@@ -1112,6 +1121,12 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
                                 let scan=if key.make==0{key.key}else{key.make};
                                 let id=KeyId::new(scan,key.flags);
                                 let delay=age;
+                                let was_held=down && app.keyboard.observed_vk_states()
+                                    .iter().any(|(vk,_,held)|*vk==key.key && *held);
+                                app.flight.observe(FlightEvent::new(
+                                    tick,Lane::RawKey,
+                                    if !down{"UP"}else if was_held{"REPEAT"}else{"DOWN"},
+                                    key.key,raw.header.device as usize,0,delay));
                                 app.keyboard.observe_queue_age(delay);
                                 let label=key_name(key.key,scan,key.flags);
                                 if app.mode==4 {
