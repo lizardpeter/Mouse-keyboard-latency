@@ -310,6 +310,11 @@ fn get_text(hwnd:H)->String {
 /// Observe real character messages delivered to the native test EDIT control.
 /// Only this specific, focused textbox is subclassed; no global Windows hooks.
 unsafe extern "system" fn typing_edit_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP {
+    STATE.with(|cell|{
+        if let Ok(state)=cell.try_borrow(){
+            if let Some(app)=state.as_ref(){app.watchdog.beat(now());}
+        }
+    });
     if matches!(msg,WM_KEYDOWN|WM_KEYUP|WM_SYSKEYDOWN|WM_SYSKEYUP){
         record_key_message(msg,wp,lp);
     }
@@ -1134,6 +1139,13 @@ unsafe fn make_gui(hwnd:H){
     select_mode(hwnd,1);
 }
 unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
+    // A heartbeat is published on each GUI callback, not just WM_TIMER.
+    // WM_TIMER is low priority when input is saturated.
+    STATE.with(|cell|{
+        if let Ok(state)=cell.try_borrow(){
+            if let Some(app)=state.as_ref(){app.watchdog.beat(now());}
+        }
+    });
     if matches!(msg,WM_KEYDOWN|WM_KEYUP|WM_SYSKEYDOWN|WM_SYSKEYUP) {
         record_key_message(msg,wp,lp);
     }
@@ -1302,7 +1314,19 @@ unsafe extern "system" fn wnd_proc(hwnd:H,msg:u32,wp:WP,lp:LP)->LP{
             let changed=STATE.with(|cell|{
                 let mut state=cell.borrow_mut();
                 let Some(app)=state.as_mut()else{return false};
-                if !app.active{return false;}
+                if !app.active {
+                    app.watchdog.drain();
+                    return false;
+                }
+                let when=now();
+                app.flight.finish(when);
+                for gap in app.watchdog.drain(){
+                    if matches!(app.mode,2|4|5){
+                        app.flight.observe(FlightEvent::new(gap.ended,
+                            Lane::Watchdog,"GUI_STALL",0,0,
+                            gap.duration_ms.round() as i32,0));
+                    }
+                }
                 if app.mode==2 || app.mode==4 {
                     let when=now();
                     let observed=app.keyboard.observed_vk_states();
