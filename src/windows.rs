@@ -561,7 +561,7 @@ fn flight_action(hwnd:H,id:usize){
                     if app.active && matches!(app.mode,2|4|5|6){
                         app.flight.manual_capture(now());
                         if app.mode==6{app.flight.finish_early();}
-                        app.note="Manual flight marker recorded in memory. Keep diagnostic test running for 5s, then open Flight tab.".into();
+                        app.note="Manual incident marker saved in memory. Continue for 5 seconds. New incidents no longer overwrite the first capture.".into();
                     }else{app.note="Select Keyboard, Typing, or Mouse to start a diagnostic capture.".into();}
                 },
                 ID_FLIGHT_ZOOM_IN=>app.flight.zoom(true),
@@ -692,7 +692,9 @@ fn refresh() {
                 set_text(v.status,&app.flight.summary());
                 let dropped=app.capture.as_ref().map_or(0,InputCapture::dropped);
                 set_text(v.threads,&app.thread_metrics.short_status(dropped));
-                set_text(v.markers,&app.flight.marker_list());
+                set_text(v.markers,&format!(
+                    "LIVE INCIDENT COUNTERS\r\n{}\r\n{}",
+                    app.live_probe.short_status(),app.flight.marker_list()));
                 let (start,end)=app.flight.view_bounds_ms(timestamp);
                 set_text(v.window,&format!(
                     "View {:.3}–{:.3}s | span {:.2}s | pan {:.2}s",
@@ -714,7 +716,9 @@ fn refresh() {
                 "Down: {}     Up: {}     Auto-repeats: {}     Unmatched key-ups: {}     Max held together: {}",
                 kd.downs,kd.ups,kd.repeats,kd.orphan_ups,kd.maximum_simultaneous));
             set_text(k.held,&kd.held_display(timestamp));
-            set_text(k.alerts,&kd.alert_display(timestamp));
+            set_text(k.alerts,&format!(
+                "{}\r\n{}",
+                kd.alert_display(timestamp),app.live_probe.short_status()));
             set_text(k.durations,&format!(
                 "Currently held: {}  |  Last down→up: {}  |  Longest: {:.1} ms  |  Shortest event gap: {}",
                 kd.held_count(),
@@ -947,6 +951,7 @@ fn save_report(hwnd:H) {
         }
         app.thread_metrics.append_report(&mut snapshot,
             app.capture.as_ref().map_or(0,InputCapture::dropped));
+        app.live_probe.append_report(&mut snapshot);
         (previous,snapshot)
     });
     if contents.is_empty(){return;}
@@ -1141,7 +1146,7 @@ unsafe fn make_gui(hwnd:H){
         32,905,870,25,f_small);
     CREATE_GROUP.with(|g|g.set(6));
     text(hwnd,instance,"ANOMALY FLIGHT RECORDER",32,230,870,35,f_title);
-    text(hwnd,instance,"Capture is memory-only. Start on Keyboard, Typing or Mouse; switch here to inspect.",
+    text(hwnd,instance,"Captures recur automatically, keeping up to six episodes. Start in Keyboard, Typing or Mouse.",
         32,271,640,25,f_small);
     control(hwnd,instance,"BUTTON","Save Flight Report",ID_DIAGNOSTIC_REPORT,
         685,264,218,41,WS_TABSTOP|BS_PUSHBUTTON,f_medium);
@@ -1159,7 +1164,7 @@ unsafe fn make_gui(hwnd:H){
     text(hwnd,instance,"CAPTURE MARKERS / AUTOMATIC DETECTIONS",32,794,865,24,f_medium);
     let flight_markers=control(hwnd,instance,"EDIT","",0,
         32,822,870,80,WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY,f_small);
-    text(hwnd,instance,"Bars are host-delivery timestamps, not USB packet timestamps. Save only after reviewing key identifiers.",
+    text(hwnd,instance,"Mouse gaps may be hand pauses. Click-after-release is an action marker, not physical switch proof.",
         32,908,870,23,f_small);
 
     CREATE_GROUP.with(|g|g.set(0));
