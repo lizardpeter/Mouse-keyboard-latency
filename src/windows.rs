@@ -8,10 +8,12 @@ use crate::typing::TypingMonitor;
 use crate::deep_trace::{DeepTrace,TraceEvent};
 use crate::mouse_diagnostics::MouseDiagnostics;
 use crate::polling::PollingMonitor;
-use crate::flight::{FlightRecorder,FlightEvent,Lane,LANES};
+use crate::flight::{FlightRecorder,FlightEvent,Lane,Reason,LANES};
 use crate::watchdog::Watchdog;
 use crate::input_capture::{InputCapture,CapturedInput,Kind as CapturedKind,MAX_DRAIN_PER_PULSE,current_processor};
 use crate::thread_metrics::{ThreadMetrics,TimingSample};
+use crate::live_probe::{LiveProbe,IncidentKind};
+use crate::scheduler_probe::SchedulerProbe;
 use crate::hid_poll::get_hid_polled_interval_ms;
 use std::fmt::Write as _;
 use std::cell::Cell;
@@ -213,6 +215,7 @@ struct State {
     polling:PollingMonitor,
     flight:FlightRecorder,flight_views:Option<FlightViews>,watchdog:Watchdog,
     capture_watchdog:Watchdog,capture:Option<InputCapture>,thread_metrics:ThreadMetrics,
+    live_probe:LiveProbe,scheduler_probe:SchedulerProbe,
 }
 thread_local! {
     static STATE:RefCell<Option<State>>=const{RefCell::new(None)};
@@ -234,6 +237,7 @@ fn sync_capture(app:&mut State){
     let enabled=app.active && matches!(app.mode,2|4|5);
     app.watchdog.set_active(enabled,now());
     app.capture_watchdog.set_active(enabled,now());
+    app.scheduler_probe.set_active(enabled);
 }
 fn queue_bits()->u32 {
     // High word shows present queue bits. GetQueueStatus does not remove messages.
@@ -420,6 +424,7 @@ fn select_mode(hwnd:H,new_mode:usize){
         app.capture_watchdog.set_active(app.active && matches!(new_mode,2|4|5),now());
         if app.mode!=new_mode && (app.mode==2 || app.mode==4 || new_mode==2 || new_mode==4) {
             app.keyboard.suspend();
+            app.live_probe.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
         }
@@ -765,6 +770,7 @@ fn toggle(){
             app.flight.clear_temporal_state();
             app.session.break_pair();
             app.keyboard.suspend();
+            app.live_probe.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.active=!app.active;
@@ -781,6 +787,7 @@ fn reset(){
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             if matches!(app.mode,2|4|5|6){
+                app.live_probe=LiveProbe::new(app.frequency,now());
                 app.flight=FlightRecorder::new(app.frequency,now());
                 app.watchdog.drain();
                 sync_capture(app);
@@ -883,6 +890,7 @@ fn save(hwnd:H){
             // A key released while the modal dialog had focus must not
             // appear stuck after returning to the diagnostics screen.
             app.keyboard.suspend();
+            app.live_probe.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.session.break_pair();
@@ -975,6 +983,7 @@ fn save_report(hwnd:H) {
     STATE.with(|cell|{
         if let Some(app)=cell.borrow_mut().as_mut(){
             app.keyboard.suspend();
+            app.live_probe.suspend();
             app.os_keys.clear_pending();
             app.typing.suspend();
             app.session.break_pair();
@@ -1407,6 +1416,8 @@ pub fn run()->Result<(),Box<dyn std::error::Error>>{
             watchdog:Watchdog::new(frequency,now),
             capture_watchdog:Watchdog::new(frequency,now),capture:None,
             thread_metrics:ThreadMetrics::new(frequency,now()),
+            live_probe:LiveProbe::new(frequency,now()),
+            scheduler_probe:SchedulerProbe::new(frequency,now),
         });
     });
     let cls=wide("MouseKeyboardLatencyGui");
